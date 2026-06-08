@@ -1,0 +1,742 @@
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { createRoot } from "react-dom/client";
+import "./styles.css";
+
+const STORAGE_KEY = "lumen.voice.messages.v1";
+const MAX_RECORDING_MS = 60_000;
+
+const exampleMessages = [
+  {
+    id: 1,
+    sender: "Sarah",
+    side: "family",
+    kind: "text",
+    text: "Morning Mum. Did you sleep alright?",
+    time: "8:42 AM",
+  },
+  {
+    id: 2,
+    sender: "Margaret",
+    side: "patient",
+    kind: "voice",
+    duration: "0:18",
+    time: "8:45 AM",
+    transcript:
+      "Yes love, I slept well. I wanted to ask if you could bring the thing you use to open the tins, the little silver one.",
+    flagged: true,
+    analysis: {
+      tag: "word-finding difficulty detected",
+      timestamp: "Today, 8:45 AM",
+      patterns: ["object naming", "function-over-name phrase", "extended pause"],
+      pauseMarkers: 4,
+      fillerCount: 0,
+      disfluencyRate: 0.078,
+      baselineComparison: "above-baseline",
+      summary: "A few naming detours appeared in this note. It may be worth mentioning gently if it continues.",
+      highlights: ["the thing you use to open the tins", "the little silver one"],
+    },
+  },
+  {
+    id: 3,
+    sender: "Sarah",
+    side: "family",
+    kind: "text",
+    text: "Of course. I’ll bring it with the soup.",
+    time: "8:48 AM",
+  },
+  {
+    id: 4,
+    sender: "Margaret",
+    side: "patient",
+    kind: "voice",
+    duration: "0:23",
+    time: "9:06 AM",
+    transcript:
+      "And could you phone the, um, you know, the man from next door, Peter. I left his bowl here.",
+    flagged: true,
+    analysis: {
+      tag: "word-finding difficulty detected",
+      timestamp: "Today, 9:06 AM",
+      patterns: ["person naming", "filler token", "self-correction"],
+      pauseMarkers: 3,
+      fillerCount: 2,
+      disfluencyRate: 0.069,
+      baselineComparison: "above-baseline",
+      summary: "There were a few pauses and a self-correction around a person’s name.",
+      highlights: ["the, um, you know", "Peter"],
+    },
+  },
+  {
+    id: 5,
+    sender: "Margaret",
+    side: "patient",
+    kind: "text",
+    text: "Thank you sweetheart.",
+    time: "9:07 AM",
+  },
+];
+
+const weeklyTrend = [
+  { day: "Mon", value: 2 },
+  { day: "Tue", value: 1 },
+  { day: "Wed", value: 3 },
+  { day: "Thu", value: 2 },
+  { day: "Fri", value: 4 },
+  { day: "Sat", value: 3 },
+  { day: "Sun", value: 5 },
+];
+
+function App() {
+  const [view, setView] = useState("user");
+  const [screen, setScreen] = useState("chat");
+  const [selected, setSelected] = useState(exampleMessages.find((message) => message.flagged));
+  const exampleFlagged = useMemo(() => exampleMessages.filter((message) => message.flagged), []);
+
+  function switchView(nextView) {
+    setView(nextView);
+    setScreen("chat");
+  }
+
+  return (
+    <main className="app-shell">
+      <section className="phone-frame" aria-label="Lumen mobile app">
+        <div className="opening-glow" />
+        <header className="app-header">
+          <button className="logo-button" onClick={() => setScreen("chat")} aria-label="Go to chat">
+            <span className="logo-mark">L</span>
+            <span>
+              <strong>Lumen</strong>
+              <small>Voice care</small>
+            </span>
+          </button>
+          <div className="view-toggle" aria-label="Demo perspective">
+            <button className={view === "user" ? "active" : ""} onClick={() => switchView("user")}>
+              User
+            </button>
+            <button className={view === "example" ? "active" : ""} onClick={() => switchView("example")}>
+              Example
+            </button>
+          </div>
+        </header>
+
+        <nav className="tabs" aria-label="Primary navigation">
+          <button className={screen === "chat" ? "active" : ""} onClick={() => setScreen("chat")}>
+            Chat
+          </button>
+          <button
+            className={screen === "dashboard" ? "active" : ""}
+            onClick={() => setScreen("dashboard")}
+            disabled={view !== "example"}
+          >
+            Dashboard
+          </button>
+          <button className={screen === "settings" ? "active" : ""} onClick={() => setScreen("settings")}>
+            Settings
+          </button>
+        </nav>
+
+        {screen === "chat" && view === "user" && <UserChatScreen />}
+        {screen === "chat" && view === "example" && (
+          <ExampleChatScreen
+            messages={exampleMessages}
+            onSelect={(message) => {
+              setSelected(message);
+              setScreen("detail");
+            }}
+          />
+        )}
+        {screen === "dashboard" && view === "example" && (
+          <DashboardScreen
+            flaggedMessages={exampleFlagged}
+            onSelect={(message) => {
+              setSelected(message);
+              setScreen("detail");
+            }}
+          />
+        )}
+        {screen === "detail" && selected && (
+          <DetailScreen message={selected} onBack={() => setScreen(view === "example" ? "dashboard" : "chat")} />
+        )}
+        {screen === "settings" && <SettingsScreen view={view} />}
+      </section>
+    </main>
+  );
+}
+
+function UserChatScreen() {
+  const [messages, setMessages] = useLocalMessages();
+  const [status, setStatus] = useState("idle");
+  const [elapsedMs, setElapsedMs] = useState(0);
+  const [error, setError] = useState("");
+  const mediaRecorderRef = useRef(null);
+  const streamRef = useRef(null);
+  const chunksRef = useRef([]);
+  const startedAtRef = useRef(0);
+  const timerRef = useRef(null);
+
+  useEffect(() => {
+    return () => stopMediaTracks(streamRef.current);
+  }, []);
+
+  async function startRecording() {
+    setError("");
+    if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
+      setError("This browser cannot record audio here. Try a recent Chrome, Edge, or Safari build.");
+      return;
+    }
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      chunksRef.current = [];
+      const recorder = new MediaRecorder(stream, { mimeType: preferredMimeType() });
+      mediaRecorderRef.current = recorder;
+      startedAtRef.current = Date.now();
+      setElapsedMs(0);
+      setStatus("recording");
+
+      recorder.ondataavailable = (event) => {
+        if (event.data.size > 0) chunksRef.current.push(event.data);
+      };
+      recorder.onstop = () => {
+        stopMediaTracks(streamRef.current);
+        streamRef.current = null;
+      };
+      recorder.start();
+
+      timerRef.current = window.setInterval(() => {
+        const elapsed = Date.now() - startedAtRef.current;
+        setElapsedMs(elapsed);
+        if (elapsed >= MAX_RECORDING_MS) stopRecording();
+      }, 250);
+    } catch {
+      setStatus("idle");
+      setError("Microphone access is needed to record a voice note. You can allow it and try again.");
+    }
+  }
+
+  async function stopRecording() {
+    if (timerRef.current) window.clearInterval(timerRef.current);
+    const recorder = mediaRecorderRef.current;
+    if (!recorder || recorder.state === "inactive") return;
+
+    const stopped = new Promise((resolve) => {
+      recorder.addEventListener("stop", resolve, { once: true });
+    });
+    recorder.stop();
+    await stopped;
+
+    const durationMs = Math.min(Date.now() - startedAtRef.current, MAX_RECORDING_MS);
+    const audioBlob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
+    const localId = crypto.randomUUID();
+    const localMessage = {
+      id: localId,
+      kind: "voice",
+      side: "user",
+      createdAt: new Date().toISOString(),
+      durationMs,
+      status: "processing",
+      transcript: "",
+      reply: "",
+      analysis: null,
+      localAudioUrl: URL.createObjectURL(audioBlob),
+    };
+
+    setMessages((current) => [...current, localMessage]);
+    setStatus("processing");
+    await analyseVoiceNote(audioBlob, durationMs, localId);
+  }
+
+  async function analyseVoiceNote(audioBlob, durationMs, localId) {
+    try {
+      const metrics = await estimateAudioMetrics(audioBlob, durationMs);
+      const result = await postVoiceAnalysis(audioBlob, { ...metrics, durationMs });
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === localId
+            ? {
+                ...message,
+                ...result,
+                id: localId,
+                durationMs,
+                status: "complete",
+                createdAt: message.createdAt,
+                localAudioUrl: message.localAudioUrl,
+              }
+            : message,
+        ),
+      );
+      setStatus("idle");
+    } catch (apiError) {
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === localId
+            ? {
+                ...message,
+                status: "error",
+                error: apiError.message || "Analysis could not finish. Please try again.",
+              }
+            : message,
+        ),
+      );
+      setStatus("idle");
+    }
+  }
+
+  function clearHistory() {
+    messages.forEach((message) => {
+      if (message.localAudioUrl) URL.revokeObjectURL(message.localAudioUrl);
+    });
+    setMessages([]);
+    setError("");
+  }
+
+  const isRecording = status === "recording";
+  const isProcessing = status === "processing";
+
+  return (
+    <section className="screen chat-screen">
+      <div className="chat-title user-title">
+        <div className="avatar">Y</div>
+        <div>
+          <h1>Your voice notes</h1>
+          <p>Record, reflect, and receive a warm reply.</p>
+        </div>
+      </div>
+
+      <div className="thread">
+        {messages.length === 0 && (
+          <article className="empty-state">
+            <strong>A quiet place to start.</strong>
+            <p>Record a short voice note. Lumen will transcribe it, notice speech patterns, and answer warmly.</p>
+          </article>
+        )}
+
+        {messages.map((message, index) => (
+          <UserMessage key={message.id} message={message} index={index} />
+        ))}
+      </div>
+
+      {error && <p className="status-note alert">{error}</p>}
+      {isRecording && <p className="status-note">Recording {formatDuration(elapsedMs)} of 1:00</p>}
+      {isProcessing && <p className="status-note">Listening carefully and preparing a reply...</p>}
+
+      <div className="composer">
+        <button className="soft-icon" onClick={clearHistory} aria-label="Clear local history">
+          ×
+        </button>
+        <div className="composer-field">
+          {isRecording ? "Tap Send when you’re ready" : isProcessing ? "Analysing voice note" : "Record a voice note"}
+        </div>
+        <button
+          className={`record-button ${isRecording ? "recording" : ""}`}
+          onClick={isRecording ? stopRecording : startRecording}
+          disabled={isProcessing}
+          aria-label={isRecording ? "Send voice message" : "Record voice message"}
+        >
+          {isRecording ? "Send" : "Voice"}
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function UserMessage({ message, index }) {
+  return (
+    <>
+      <article className="message-row mine" style={{ animationDelay: `${120 + index * 80}ms` }}>
+        <div className={`bubble voice ${message.status === "error" ? "error" : ""}`}>
+          <div className="voice-card static">
+            <span className="play-dot" />
+            <Waveform animate={message.status === "processing"} />
+            <span className="duration">{formatDuration(message.durationMs)}</span>
+          </div>
+          <time>{formatTime(message.createdAt)}</time>
+          {message.status === "processing" && <p className="mini-copy">Analysing gently...</p>}
+          {message.status === "error" && <p className="mini-copy">{message.error}</p>}
+        </div>
+      </article>
+
+      {message.status === "complete" && (
+        <>
+          <article className="message-row theirs">
+            <div className="bubble transcript-bubble">
+              <strong>Transcript</strong>
+              <p>{highlightTranscript(message.transcript, message.analysis?.highlights || [])}</p>
+            </div>
+          </article>
+          <article className="message-row theirs">
+            <div className={`bubble analysis-bubble ${message.analysis?.flagged ? "flagged" : ""}`}>
+              <strong>{message.analysis?.flagged ? "Worth noticing gently" : "Within today’s baseline"}</strong>
+              <p>{message.analysis?.summary}</p>
+              <AnalysisSummary analysis={message.analysis} />
+            </div>
+          </article>
+          <article className="message-row theirs">
+            <div className="bubble reply-bubble">
+              <strong>Lumen</strong>
+              <p>{message.reply}</p>
+            </div>
+          </article>
+        </>
+      )}
+    </>
+  );
+}
+
+function AnalysisSummary({ analysis }) {
+  if (!analysis) return null;
+  return (
+    <div className="analysis-inline">
+      <div>
+        <span>Pauses</span>
+        <strong>{analysis.pauseMarkers}</strong>
+      </div>
+      <div>
+        <span>Fillers</span>
+        <strong>{analysis.fillerCount}</strong>
+      </div>
+      <div>
+        <span>Rate</span>
+        <strong>{Math.round((analysis.disfluencyRate || 0) * 100)}%</strong>
+      </div>
+      <div className="pattern-grid compact">
+        {(analysis.patterns || []).map((pattern) => (
+          <span key={pattern}>{pattern}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function ExampleChatScreen({ messages, onSelect }) {
+  return (
+    <section className="screen chat-screen">
+      <div className="chat-title">
+        <div className="avatar">M</div>
+        <div>
+          <h1>Margaret</h1>
+          <p>Example family view</p>
+        </div>
+      </div>
+
+      <div className="thread">
+        {messages.map((message, index) => (
+          <ExampleMessageBubble key={message.id} message={message} index={index} onSelect={onSelect} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function ExampleMessageBubble({ message, index, onSelect }) {
+  const isMine = message.side === "family";
+  const familyFlagVisible = message.flagged;
+  return (
+    <article
+      className={`message-row ${isMine ? "mine" : "theirs"}`}
+      style={{ animationDelay: `${220 + index * 130}ms` }}
+    >
+      <div className={`bubble ${message.kind} ${familyFlagVisible ? "flagged" : ""}`}>
+        {message.kind === "text" ? (
+          <p>{message.text}</p>
+        ) : (
+          <button
+            className="voice-card"
+            onClick={() => familyFlagVisible && onSelect(message)}
+            aria-label={familyFlagVisible ? "Open flagged voice message detail" : "Voice message"}
+          >
+            <span className="play-dot" />
+            <Waveform animate={false} />
+            <span className="duration">{message.duration}</span>
+          </button>
+        )}
+        {familyFlagVisible && (
+          <button className="flag-tag" onClick={() => onSelect(message)}>
+            {message.analysis.tag}
+          </button>
+        )}
+        <time>{message.time}</time>
+      </div>
+    </article>
+  );
+}
+
+function Waveform({ animate }) {
+  const bars = [30, 54, 38, 72, 44, 60, 34, 80, 42, 66, 36, 58, 46, 76, 40, 62, 35, 52];
+  return (
+    <span className={`waveform ${animate ? "drawing" : ""}`} aria-hidden="true">
+      {bars.map((height, index) => (
+        <i key={index} style={{ height: `${height}%`, animationDelay: `${index * 45}ms` }} />
+      ))}
+    </span>
+  );
+}
+
+function DashboardScreen({ flaggedMessages, onSelect }) {
+  return (
+    <section className="screen dashboard-screen">
+      <div className="section-heading">
+        <h1>Example dashboard</h1>
+        <p>Noticing changes gently, for conversations with care.</p>
+      </div>
+
+      <div className="metric-grid">
+        <Metric label="Flagged this week" value="12" tone="amber" />
+        <Metric label="Pause markers" value="31" tone="sage" />
+        <Metric label="Vs baseline" value="1.7x" tone="rose" />
+      </div>
+
+      <section className="panel trend-panel">
+        <div className="panel-title">
+          <h2>Weekly trend</h2>
+          <span>Personal baseline 4.3%</span>
+        </div>
+        <div className="bar-chart" aria-label="Weekly flagged message bar chart">
+          {weeklyTrend.map((bar, index) => (
+            <div className="bar-column" key={bar.day}>
+              <span className="bar" style={{ "--height": `${bar.value * 18}%`, animationDelay: `${index * 90}ms` }} />
+              <small>{bar.day}</small>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="suggestion-card">
+        <strong>Worth discussing with your therapist</strong>
+        <p>Today’s example notes show more pauses and naming detours than Margaret’s usual pattern.</p>
+      </section>
+
+      <section className="flag-list">
+        <div className="panel-title">
+          <h2>Flagged transcripts</h2>
+          <button>Share with speech therapist</button>
+        </div>
+        {flaggedMessages.map((message) => (
+          <button className="flag-list-item" key={message.id} onClick={() => onSelect(message)}>
+            <span>
+              <strong>{message.analysis.timestamp}</strong>
+              <small>{message.analysis.patterns.join(" · ")}</small>
+            </span>
+            <b>{Math.round(message.analysis.disfluencyRate * 100)}%</b>
+          </button>
+        ))}
+      </section>
+    </section>
+  );
+}
+
+function Metric({ label, value, tone }) {
+  return (
+    <div className={`metric ${tone}`}>
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+function DetailScreen({ message, onBack }) {
+  return (
+    <section className="screen detail-screen">
+      <button className="back-button" onClick={onBack}>
+        Back
+      </button>
+      <div className="section-heading">
+        <h1>Voice note detail</h1>
+        <p>{message.analysis.timestamp}</p>
+      </div>
+
+      <section className="panel transcript-panel">
+        <h2>Transcript</h2>
+        <p>{highlightTranscript(message.transcript, message.analysis.highlights)}</p>
+      </section>
+
+      <div className="pattern-grid">
+        {message.analysis.patterns.map((pattern) => (
+          <span key={pattern}>{pattern}</span>
+        ))}
+      </div>
+
+      <section className="panel analysis-panel">
+        <div>
+          <span>Pause markers</span>
+          <strong>{message.analysis.pauseMarkers}</strong>
+        </div>
+        <div>
+          <span>Filler tokens</span>
+          <strong>{message.analysis.fillerCount}</strong>
+        </div>
+        <div>
+          <span>Disfluency rate</span>
+          <strong>{Math.round(message.analysis.disfluencyRate * 100)}%</strong>
+        </div>
+        <div>
+          <span>Baseline comparison</span>
+          <strong>{message.analysis.baselineComparison}</strong>
+        </div>
+      </section>
+
+      <section className="suggestion-card">
+        <strong>Care note</strong>
+        <p>{message.analysis.summary}</p>
+      </section>
+    </section>
+  );
+}
+
+function SettingsScreen({ view }) {
+  const [messages, setMessages] = useLocalMessages();
+  return (
+    <section className="screen settings-screen">
+      <div className="section-heading">
+        <h1>Settings</h1>
+        <p>{view === "user" ? "Local history and analysis preferences." : "Example visibility and sensitivity."}</p>
+      </div>
+
+      <section className="settings-list">
+        <label className="setting-row">
+          <span>
+            <strong>Consent for local voice analysis</strong>
+            <small>Recordings are analysed when you send them. History stays in this browser.</small>
+          </span>
+          <input type="checkbox" defaultChecked />
+        </label>
+
+        <div className="setting-row">
+          <span>
+            <strong>Saved voice notes</strong>
+            <small>{messages.length} local item{messages.length === 1 ? "" : "s"}</small>
+          </span>
+          <button className="small-button" onClick={() => setMessages([])}>
+            Clear
+          </button>
+        </div>
+
+        <label className="setting-row vertical">
+          <span>
+            <strong>Sensitivity threshold</strong>
+            <small>Only surface patterns above the usual baseline.</small>
+          </span>
+          <input type="range" min="1" max="3" step="0.1" defaultValue="1.5" />
+          <div className="range-labels">
+            <small>Gentle</small>
+            <small>Balanced</small>
+            <small>Careful</small>
+          </div>
+        </label>
+      </section>
+    </section>
+  );
+}
+
+function useLocalMessages() {
+  const [messages, setMessagesState] = useState(() => {
+    try {
+      return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
+    } catch {
+      return [];
+    }
+  });
+
+  const setMessages = (next) => {
+    setMessagesState((current) => {
+      const resolved = typeof next === "function" ? next(current) : next;
+      const persistable = resolved.map(({ localAudioUrl, ...message }) => message);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(persistable));
+      return resolved;
+    });
+  };
+
+  return [messages, setMessages];
+}
+
+async function postVoiceAnalysis(audioBlob, metrics) {
+  const formData = new FormData();
+  formData.append("audio", audioBlob, "voice-note.webm");
+  formData.append("metrics", JSON.stringify(metrics));
+
+  const response = await fetch("/api/analyze-voice", {
+    method: "POST",
+    body: formData,
+  });
+
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(payload.error || "Analysis could not finish. Please try again.");
+  }
+  return payload;
+}
+
+async function estimateAudioMetrics(audioBlob, durationMs) {
+  try {
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextClass) return { durationMs, pauseMarkers: 0, pauses: [] };
+    const audioContext = new AudioContextClass();
+    const audioBuffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
+    const data = audioBuffer.getChannelData(0);
+    const sampleRate = audioBuffer.sampleRate;
+    const frameSize = Math.floor(sampleRate * 0.05);
+    const pauses = [];
+    let silenceStart = null;
+
+    for (let offset = 0; offset < data.length; offset += frameSize) {
+      let sum = 0;
+      for (let index = offset; index < Math.min(offset + frameSize, data.length); index += 1) {
+        sum += data[index] * data[index];
+      }
+      const rms = Math.sqrt(sum / frameSize);
+      const timeMs = (offset / sampleRate) * 1000;
+      if (rms < 0.012) {
+        if (silenceStart === null) silenceStart = timeMs;
+      } else if (silenceStart !== null) {
+        const pauseMs = timeMs - silenceStart;
+        if (pauseMs > 500) pauses.push({ startMs: Math.round(silenceStart), durationMs: Math.round(pauseMs) });
+        silenceStart = null;
+      }
+    }
+
+    await audioContext.close();
+    return { durationMs, pauseMarkers: pauses.length, pauses: pauses.slice(0, 20) };
+  } catch {
+    return { durationMs, pauseMarkers: 0, pauses: [] };
+  }
+}
+
+function highlightTranscript(text, highlights) {
+  if (!highlights?.length) return text;
+  let remaining = text;
+  const parts = [];
+  highlights.forEach((highlight) => {
+    const index = remaining.toLowerCase().indexOf(String(highlight).toLowerCase());
+    if (index === -1) return;
+    if (index > 0) parts.push(remaining.slice(0, index));
+    parts.push(<mark key={`${highlight}-${parts.length}`}>{remaining.slice(index, index + highlight.length)}</mark>);
+    remaining = remaining.slice(index + highlight.length);
+  });
+  parts.push(remaining);
+  return parts;
+}
+
+function preferredMimeType() {
+  const types = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4"];
+  return types.find((type) => MediaRecorder.isTypeSupported(type)) || "";
+}
+
+function stopMediaTracks(stream) {
+  stream?.getTracks().forEach((track) => track.stop());
+}
+
+function formatDuration(ms = 0) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = String(totalSeconds % 60).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+function formatTime(value) {
+  if (!value) return "";
+  return new Intl.DateTimeFormat([], { hour: "numeric", minute: "2-digit" }).format(new Date(value));
+}
+
+createRoot(document.getElementById("root")).render(<App />);
