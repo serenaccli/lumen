@@ -124,7 +124,9 @@ button {
 }
 
 .view-toggle button.active,
-.tabs button.active {
+.tabs button.active,
+.sub-tabs button.active,
+.role-picker button.active {
   background: #fffaf4;
   color: #2c2420;
   box-shadow: 0 8px 20px rgba(44, 36, 32, 0.08);
@@ -153,6 +155,30 @@ button {
   flex-direction: column;
   padding: 0 22px 22px;
   animation: screenRise 650ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.sub-tabs,
+.role-picker {
+  display: flex;
+  gap: 8px;
+  padding: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.54);
+  box-shadow: inset 0 0 0 1px rgba(44, 36, 32, 0.08);
+}
+
+.sub-tabs {
+  margin-bottom: 10px;
+}
+
+.sub-tabs button,
+.role-picker button {
+  flex: 1;
+  min-height: 34px;
+  border-radius: 999px;
+  background: transparent;
+  color: #6f6159;
+  transition: background 350ms ease, color 350ms ease, box-shadow 350ms ease;
 }
 
 .loading-frame {
@@ -518,6 +544,33 @@ p {
 .empty-state p {
   color: #6f6159;
   line-height: 1.45;
+}
+
+.request-card {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 10px;
+  padding: 16px;
+  border-radius: 24px;
+  background: rgba(255, 250, 244, 0.84);
+  box-shadow: 0 12px 34px rgba(44, 36, 32, 0.07);
+  animation: bubbleArrive 620ms cubic-bezier(0.18, 1.18, 0.32, 1) both;
+}
+
+.request-card p,
+.request-card small {
+  display: block;
+  color: #7f6f66;
+}
+
+.request-card button {
+  min-height: 40px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: #e5d8f1;
+  color: #4d3f61;
 }
 
 .auth-screen {

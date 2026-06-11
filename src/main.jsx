@@ -193,7 +193,7 @@ function App() {
 
 function AuthScreen({ onAuthed }) {
   const [mode, setMode] = useState("register");
-  const [form, setForm] = useState({ name: "", email: "", password: "" });
+  const [form, setForm] = useState({ name: "", email: "", password: "", role: "older" });
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
 
@@ -219,10 +219,20 @@ function AuthScreen({ onAuthed }) {
       </div>
       <form className="auth-form" onSubmit={submit}>
         {mode === "register" && (
-          <label>
-            <span>Name</span>
-            <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
-          </label>
+          <>
+            <label>
+              <span>Name</span>
+              <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
+            </label>
+            <div className="role-picker" aria-label="Account role">
+              <button type="button" className={form.role === "older" ? "active" : ""} onClick={() => setForm({ ...form, role: "older" })}>
+                Older person
+              </button>
+              <button type="button" className={form.role === "relative" ? "active" : ""} onClick={() => setForm({ ...form, role: "relative" })}>
+                Younger relative
+              </button>
+            </div>
+          </>
         )}
         <label>
           <span>Email</span>
@@ -256,6 +266,8 @@ function AuthScreen({ onAuthed }) {
 
 function UserChatScreen({ user }) {
   const [contacts, setContacts] = useState([]);
+  const [requests, setRequests] = useState([]);
+  const [threadTab, setThreadTab] = useState("messages");
   const [selectedContactId, setSelectedContactId] = useState("");
   const [messages, setMessages] = useState([]);
   const [contactEmail, setContactEmail] = useState("");
@@ -293,6 +305,7 @@ function UserChatScreen({ user }) {
       const payload = await apiGet("/api/contacts");
       const nextContacts = payload.contacts || [];
       setContacts(nextContacts);
+      setRequests(payload.requests || []);
       setSelectedContactId((current) => current || nextContacts[0]?.id || "");
     } catch (apiError) {
       setError(apiError.message);
@@ -316,8 +329,10 @@ function UserChatScreen({ user }) {
       const payload = await apiPost("/api/contacts", { email: contactEmail });
       const nextContacts = payload.contacts || [];
       setContacts(nextContacts);
+      setRequests(payload.requests || []);
       const added = nextContacts.find((contact) => contact.email === contactEmail.trim().toLowerCase());
       setSelectedContactId(added?.id || nextContacts[0]?.id || "");
+      setThreadTab("messages");
       setContactEmail("");
     } catch (apiError) {
       setError(apiError.message);
@@ -335,6 +350,20 @@ function UserChatScreen({ user }) {
       setMessages((current) => [...current, payload.message]);
     } catch (apiError) {
       setTextDraft(text);
+      setError(apiError.message);
+    }
+  }
+
+  async function acceptRequest(requestId) {
+    setError("");
+    try {
+      const payload = await apiPost(`/api/contacts/${requestId}/accept`, {});
+      setContacts(payload.contacts || []);
+      setRequests(payload.requests || []);
+      const accepted = (payload.contacts || []).find((contact) => contact.contactRecordId === requestId);
+      setSelectedContactId(accepted?.id || selectedContactId);
+      setThreadTab("messages");
+    } catch (apiError) {
       setError(apiError.message);
     }
   }
@@ -475,27 +504,32 @@ function UserChatScreen({ user }) {
         <div className="avatar">{selectedContact ? selectedContact.name.slice(0, 1).toUpperCase() : user.name.slice(0, 1).toUpperCase()}</div>
         <div>
           <h1>{selectedContact ? selectedContact.name : "Your relatives"}</h1>
-          <p>
-            {selectedContact
-              ? selectedContact.pending
-                ? "Pending invite thread"
-                : "Messages and voice notes"
-              : "Add someone to start talking"}
-          </p>
+          <p>{roleLabel(user.role)} · {selectedContact ? selectedContact.email : "Add someone to start talking"}</p>
         </div>
       </div>
 
-      <form className="contact-form" onSubmit={addContact}>
-        <input
-          type="email"
-          placeholder="Relative’s email"
-          value={contactEmail}
-          onChange={(event) => setContactEmail(event.target.value)}
-        />
-        <button>Add</button>
-      </form>
+      <div className="sub-tabs" aria-label="Messaging sections">
+        <button className={threadTab === "messages" ? "active" : ""} onClick={() => setThreadTab("messages")}>
+          Messages
+        </button>
+        <button className={threadTab === "requests" ? "active" : ""} onClick={() => setThreadTab("requests")}>
+          Requests {requests.length ? `(${requests.length})` : ""}
+        </button>
+      </div>
 
-      {contacts.length > 0 && (
+      {threadTab === "messages" && (
+        <form className="contact-form" onSubmit={addContact}>
+          <input
+            type="email"
+            placeholder={user.role === "older" ? "Younger relative’s email" : "Older person’s email"}
+            value={contactEmail}
+            onChange={(event) => setContactEmail(event.target.value)}
+          />
+          <button>Add</button>
+        </form>
+      )}
+
+      {threadTab === "messages" && contacts.length > 0 && (
         <div className="contact-strip" aria-label="Relatives">
           {contacts.map((contact) => (
             <button
@@ -511,14 +545,18 @@ function UserChatScreen({ user }) {
       )}
 
       <div className="thread">
-        {!selectedContact && (
+        {threadTab === "requests" && (
+          <MessageRequests requests={requests} onAccept={acceptRequest} currentUserRole={user.role} />
+        )}
+
+        {threadTab === "messages" && !selectedContact && (
           <article className="empty-state">
-            <strong>Add a relative first.</strong>
-            <p>Ask them to create a Lumen account, then add their email here to start a real conversation.</p>
+            <strong>Choose who you’re talking to.</strong>
+            <p>Add a relative by email, or open Requests to accept someone who added you.</p>
           </article>
         )}
 
-        {selectedContact && messages.length === 0 && (
+        {threadTab === "messages" && selectedContact && messages.length === 0 && (
           <article className="empty-state">
             <strong>A quiet thread.</strong>
             <p>
@@ -528,9 +566,10 @@ function UserChatScreen({ user }) {
           </article>
         )}
 
-        {messages.map((message, index) => (
-          <UserMessage key={message.id} message={message} index={index} currentUserId={user.id} />
-        ))}
+        {threadTab === "messages" &&
+          messages.map((message, index) => (
+            <UserMessage key={message.id} message={message} index={index} currentUser={user} />
+          ))}
       </div>
 
       {error && <p className="status-note alert">{error}</p>}
@@ -538,6 +577,7 @@ function UserChatScreen({ user }) {
       {isRecording && liveTranscript && <p className="status-note transcript-live">Heard: {liveTranscript}</p>}
       {isProcessing && <p className="status-note">Listening carefully and preparing a reply...</p>}
 
+      {threadTab === "messages" && (
       <form className="composer message-composer" onSubmit={sendText}>
         <button type="button" className="soft-icon" onClick={clearHistory} aria-label="Clear saved messages">
           ×
@@ -562,12 +602,37 @@ function UserChatScreen({ user }) {
           {isRecording ? "Send" : "Voice"}
         </button>
       </form>
+      )}
     </section>
   );
 }
 
-function UserMessage({ message, index, currentUserId }) {
-  const isMine = message.fromUserId === currentUserId;
+function MessageRequests({ requests, onAccept, currentUserRole }) {
+  if (!requests.length) {
+    return (
+      <article className="empty-state">
+        <strong>No message requests.</strong>
+        <p>Requests from {currentUserRole === "older" ? "younger relatives" : "older family members"} will appear here.</p>
+      </article>
+    );
+  }
+
+  return requests.map((request) => (
+    <article className="request-card" key={request.id}>
+      <div>
+        <strong>{request.contact.name}</strong>
+        <p>{request.contact.email}</p>
+        <small>{request.direction === "incoming" ? "Wants to message you" : "Waiting for them to join or accept"}</small>
+      </div>
+      {request.direction === "incoming" && <button onClick={() => onAccept(request.id)}>Accept</button>}
+    </article>
+  ));
+}
+
+function UserMessage({ message, index, currentUser }) {
+  const isMine = message.fromUserId === currentUser.id;
+  const senderRole = message.fromUser?.role || "older";
+  const canSeeFlag = currentUser.role !== "older" && senderRole === "older";
   if (message.kind === "text") {
     return (
       <article className={`message-row ${isMine ? "mine" : "theirs"}`} style={{ animationDelay: `${120 + index * 80}ms` }}>
@@ -596,19 +661,15 @@ function UserMessage({ message, index, currentUserId }) {
 
       {message.status === "complete" && (
         <>
-          <article className={`message-row ${isMine ? "mine" : "theirs"}`}>
-            <div className="bubble transcript-bubble">
-              <strong>Transcript</strong>
-              <p>{highlightTranscript(message.transcript, message.analysis?.highlights || [])}</p>
-            </div>
-          </article>
-          <article className={`message-row ${isMine ? "mine" : "theirs"}`}>
-            <div className={`bubble analysis-bubble ${message.analysis?.flagged ? "flagged" : ""}`}>
-              <strong>{message.analysis?.flagged ? "Worth noticing gently" : "Within today’s baseline"}</strong>
-              <p>{message.analysis?.summary}</p>
-              <AnalysisSummary analysis={message.analysis} />
-            </div>
-          </article>
+          {canSeeFlag && message.analysis?.flagged && (
+            <article className="message-row theirs">
+              <div className="bubble analysis-bubble flagged">
+                <strong>Word-finding pattern noticed</strong>
+                <p>{message.analysis?.summary}</p>
+                <AnalysisSummary analysis={message.analysis} />
+              </div>
+            </article>
+          )}
         </>
       )}
     </>
@@ -976,6 +1037,10 @@ function stopRecognition(recognition) {
   } catch {
     // Recognition may already be stopped.
   }
+}
+
+function roleLabel(role) {
+  return role === "relative" ? "Younger relative" : "Older person";
 }
 
 function formatDuration(ms = 0) {

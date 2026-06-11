@@ -49,6 +49,7 @@ app.post("/api/register", async (req, res) => {
   if (!name || !normalizedEmail || !password || String(password).length < 8) {
     return res.status(400).json({ error: "Please enter a name, email, and password of at least 8 characters." });
   }
+  const role = req.body?.role === "relative" ? "relative" : "older";
 
   const db = await loadDb();
   if (db.users.some((user) => user.email === normalizedEmail)) {
@@ -59,6 +60,7 @@ app.post("/api/register", async (req, res) => {
     id: crypto.randomUUID(),
     name: String(name).trim(),
     email: normalizedEmail,
+    role,
     password: hashPassword(password),
     createdAt: new Date().toISOString(),
   };
@@ -104,7 +106,7 @@ app.get("/api/messages", requireAuth, async (req, res) => {
   const messages = db.messages
     .filter((message) => isThreadMessage(message, req.user.id, conversation))
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
-  res.json({ messages });
+  res.json({ messages: messages.map((message) => decorateMessage(db, message)) });
 });
 
 app.delete("/api/messages", requireAuth, async (req, res) => {
@@ -116,7 +118,7 @@ app.delete("/api/messages", requireAuth, async (req, res) => {
 
 app.get("/api/contacts", requireAuth, async (req, res) => {
   const db = await loadDb();
-  res.json({ contacts: buildContacts(db, req.user.id) });
+  res.json(buildContactPayload(db, req.user.id));
 });
 
 app.post("/api/contacts", requireAuth, async (req, res) => {
@@ -142,11 +144,25 @@ app.post("/api/contacts", requireAuth, async (req, res) => {
       contactId: relative?.id || null,
       pendingEmail: relative ? null : email,
       pendingName: relative ? null : nameFromEmail(email),
+      status: "pending",
+      requestedBy: req.user.id,
       createdAt: new Date().toISOString(),
     });
   }
   await saveDb(db);
-  res.json({ contacts: buildContacts(db, req.user.id) });
+  res.json(buildContactPayload(db, req.user.id));
+});
+
+app.post("/api/contacts/:id/accept", requireAuth, async (req, res) => {
+  const db = await loadDb();
+  const contact = db.contacts.find((candidate) => candidate.id === req.params.id);
+  if (!contact || contact.contactId !== req.user.id) {
+    return res.status(404).json({ error: "That message request is not available." });
+  }
+  contact.status = "accepted";
+  contact.acceptedAt = new Date().toISOString();
+  await saveDb(db);
+  res.json(buildContactPayload(db, req.user.id));
 });
 
 app.post("/api/messages", requireAuth, async (req, res) => {
@@ -172,7 +188,7 @@ app.post("/api/messages", requireAuth, async (req, res) => {
   };
   db.messages.push(message);
   await saveDb(db);
-  res.json({ message });
+  res.json({ message: decorateMessage(db, message) });
 });
 
 app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, res) => {
@@ -222,7 +238,7 @@ app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, 
 
     db.messages.push(message);
     await saveDb(db);
-    res.json({ message });
+    res.json({ message: decorateMessage(db, message) });
   } catch (error) {
     console.error(error);
     res.status(500).json({
@@ -424,18 +440,26 @@ function readCookie(req, name) {
 }
 
 function publicUser(user) {
-  return { id: user.id, name: user.name, email: user.email };
+  return { id: user.id, name: user.name, email: user.email, role: user.role || "older" };
 }
 
-function buildContacts(db, userId) {
+function buildContactPayload(db, userId) {
+  const contacts = buildContacts(db, userId, "accepted");
+  const requests = buildRequests(db, userId);
+  return { contacts, requests };
+}
+
+function buildContacts(db, userId, status = "accepted") {
   const contacts = [];
   const seen = new Set();
   for (const contact of db.contacts || []) {
+    const contactStatus = contact.status || "accepted";
+    if (contactStatus !== status) continue;
     if (contact.userId === userId) {
       if (contact.contactId) {
         const user = db.users.find((candidate) => candidate.id === contact.contactId);
         if (user && !seen.has(user.id)) {
-          contacts.push(publicUser(user));
+          contacts.push({ ...publicUser(user), contactRecordId: contact.id });
           seen.add(user.id);
         }
       } else if (contact.pendingEmail && !seen.has(contact.id)) {
@@ -444,6 +468,7 @@ function buildContacts(db, userId) {
           name: contact.pendingName || nameFromEmail(contact.pendingEmail),
           email: contact.pendingEmail,
           pending: true,
+          contactRecordId: contact.id,
         });
         seen.add(contact.id);
       }
@@ -451,7 +476,7 @@ function buildContacts(db, userId) {
     if (contact.contactId === userId) {
       const user = db.users.find((candidate) => candidate.id === contact.userId);
       if (user && !seen.has(user.id)) {
-        contacts.push(publicUser(user));
+        contacts.push({ ...publicUser(user), contactRecordId: contact.id });
         seen.add(user.id);
       }
     }
@@ -475,6 +500,30 @@ function buildContacts(db, userId) {
   return contacts.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+function buildRequests(db, userId) {
+  return (db.contacts || [])
+    .filter((contact) => (contact.status || "accepted") === "pending")
+    .filter((contact) => contact.contactId === userId || contact.userId === userId)
+    .map((contact) => {
+      const isIncoming = contact.contactId === userId;
+      const otherUser = db.users.find((user) => user.id === (isIncoming ? contact.userId : contact.contactId));
+      return {
+        id: contact.id,
+        direction: isIncoming ? "incoming" : "outgoing",
+        status: "pending",
+        contact: otherUser
+          ? { ...publicUser(otherUser), contactRecordId: contact.id }
+          : {
+              id: contact.id,
+              name: contact.pendingName || nameFromEmail(contact.pendingEmail),
+              email: contact.pendingEmail,
+              pending: true,
+              contactRecordId: contact.id,
+            },
+      };
+    });
+}
+
 function resolveConversation(db, userId, targetId) {
   const contact = (db.contacts || []).find((candidate) => {
     return (
@@ -483,6 +532,8 @@ function resolveConversation(db, userId, targetId) {
     );
   });
   if (!contact) return null;
+  const status = contact.status || "accepted";
+  if (status === "pending" && contact.userId !== userId) return null;
   const otherUserId = contact.userId === userId ? contact.contactId : contact.userId;
   return {
     contactRecordId: contact.id,
@@ -516,6 +567,16 @@ function attachPendingContacts(db, user) {
       message.pendingContactId = null;
     }
   }
+}
+
+function decorateMessage(db, message) {
+  const fromUser = db.users.find((user) => user.id === message.fromUserId);
+  const toUser = db.users.find((user) => user.id === message.toUserId);
+  return {
+    ...message,
+    fromUser: fromUser ? publicUser(fromUser) : null,
+    toUser: toUser ? publicUser(toUser) : null,
+  };
 }
 
 function nameFromEmail(email) {
