@@ -360,6 +360,63 @@ p {
   padding-top: 12px;
 }
 
+.contact-form {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.contact-form input,
+.text-input {
+  border: 0;
+  outline: 0;
+}
+
+.contact-form input {
+  min-width: 0;
+  flex: 1;
+  min-height: 42px;
+  border-radius: 999px;
+  padding: 0 14px;
+  background: rgba(255, 250, 244, 0.86);
+  color: #2c2420;
+  box-shadow: inset 0 0 0 1px rgba(44, 36, 32, 0.08);
+}
+
+.contact-form button,
+.send-text-button {
+  min-height: 42px;
+  padding: 0 14px;
+  border-radius: 999px;
+  background: #fffaf4;
+  color: #7f5149;
+  box-shadow: 0 10px 25px rgba(44, 36, 32, 0.08);
+  transition: transform 350ms ease, opacity 350ms ease;
+}
+
+.contact-strip {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  padding: 0 0 10px;
+  scrollbar-width: none;
+}
+
+.contact-strip button {
+  flex: 0 0 auto;
+  min-height: 36px;
+  padding: 0 13px;
+  border-radius: 999px;
+  background: rgba(255, 250, 244, 0.78);
+  color: #6f6159;
+  transition: background 350ms ease, color 350ms ease;
+}
+
+.contact-strip button.active {
+  background: #e5d8f1;
+  color: #2c2420;
+}
+
 .soft-icon,
 .record-button,
 .small-button,
@@ -387,6 +444,24 @@ p {
   border-radius: 999px;
   background: rgba(255, 250, 244, 0.82);
   color: #8a7b72;
+}
+
+.text-input {
+  color: #2c2420;
+}
+
+.text-input::placeholder {
+  color: #8a7b72;
+}
+
+.message-composer {
+  align-items: center;
+}
+
+.send-text-button:disabled,
+.contact-form button:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .record-button {

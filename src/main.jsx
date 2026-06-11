@@ -255,7 +255,11 @@ function AuthScreen({ onAuthed }) {
 }
 
 function UserChatScreen({ user }) {
+  const [contacts, setContacts] = useState([]);
+  const [selectedContactId, setSelectedContactId] = useState("");
   const [messages, setMessages] = useState([]);
+  const [contactEmail, setContactEmail] = useState("");
+  const [textDraft, setTextDraft] = useState("");
   const [status, setStatus] = useState("idle");
   const [elapsedMs, setElapsedMs] = useState(0);
   const [error, setError] = useState("");
@@ -269,18 +273,68 @@ function UserChatScreen({ user }) {
   const transcriptRef = useRef("");
 
   useEffect(() => {
-    reloadMessages();
+    reloadContacts();
     return () => {
       stopMediaTracks(streamRef.current);
       stopRecognition(recognitionRef.current);
     };
   }, []);
 
-  async function reloadMessages() {
+  useEffect(() => {
+    if (selectedContactId) {
+      reloadMessages(selectedContactId);
+    } else {
+      setMessages([]);
+    }
+  }, [selectedContactId]);
+
+  async function reloadContacts() {
     try {
-      const payload = await apiGet("/api/messages");
+      const payload = await apiGet("/api/contacts");
+      const nextContacts = payload.contacts || [];
+      setContacts(nextContacts);
+      setSelectedContactId((current) => current || nextContacts[0]?.id || "");
+    } catch (apiError) {
+      setError(apiError.message);
+    }
+  }
+
+  async function reloadMessages() {
+    if (!selectedContactId) return;
+    try {
+      const payload = await apiGet(`/api/messages?contactId=${encodeURIComponent(selectedContactId)}`);
       setMessages(payload.messages || []);
     } catch (apiError) {
+      setError(apiError.message);
+    }
+  }
+
+  async function addContact(event) {
+    event.preventDefault();
+    setError("");
+    try {
+      const payload = await apiPost("/api/contacts", { email: contactEmail });
+      const nextContacts = payload.contacts || [];
+      setContacts(nextContacts);
+      const added = nextContacts.find((contact) => contact.email === contactEmail.trim().toLowerCase());
+      setSelectedContactId(added?.id || nextContacts[0]?.id || "");
+      setContactEmail("");
+    } catch (apiError) {
+      setError(apiError.message);
+    }
+  }
+
+  async function sendText(event) {
+    event.preventDefault();
+    const text = textDraft.trim();
+    if (!selectedContactId || !text) return;
+    setTextDraft("");
+    setError("");
+    try {
+      const payload = await apiPost("/api/messages", { toUserId: selectedContactId, text });
+      setMessages((current) => [...current, payload.message]);
+    } catch (apiError) {
+      setTextDraft(text);
       setError(apiError.message);
     }
   }
@@ -289,6 +343,10 @@ function UserChatScreen({ user }) {
     setError("");
     setLiveTranscript("");
     transcriptRef.current = "";
+    if (!selectedContactId) {
+      setError("Add or choose a relative before sending a voice note.");
+      return;
+    }
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       setError("This browser cannot record audio here. Try a recent Chrome, Edge, or Safari build.");
       return;
@@ -363,7 +421,8 @@ function UserChatScreen({ user }) {
     const localMessage = {
       id: localId,
       kind: "voice",
-      side: "user",
+      fromUserId: user.id,
+      toUserId: selectedContactId,
       createdAt: new Date().toISOString(),
       durationMs,
       status: "processing",
@@ -374,14 +433,14 @@ function UserChatScreen({ user }) {
 
     setMessages((current) => [...current, localMessage]);
     setStatus("processing");
-    await analyseVoiceNote(audioBlob, durationMs, localId, transcriptRef.current);
+    await analyseVoiceNote(audioBlob, durationMs, localId, transcriptRef.current, selectedContactId);
   }
 
-  async function analyseVoiceNote(audioBlob, durationMs, localId, browserTranscript) {
+  async function analyseVoiceNote(audioBlob, durationMs, localId, browserTranscript, toUserId) {
     try {
       const metrics = await estimateAudioMetrics(audioBlob, durationMs);
-      const result = await postVoiceAnalysis(audioBlob, { ...metrics, durationMs }, browserTranscript);
-      setMessages((current) => current.map((message) => (message.id === localId ? result : message)));
+      const result = await postVoiceAnalysis(audioBlob, { ...metrics, durationMs }, browserTranscript, toUserId);
+      setMessages((current) => current.map((message) => (message.id === localId ? result.message : message)));
       setStatus("idle");
       setLiveTranscript("");
     } catch (apiError) {
@@ -408,27 +467,59 @@ function UserChatScreen({ user }) {
 
   const isRecording = status === "recording";
   const isProcessing = status === "processing";
+  const selectedContact = contacts.find((contact) => contact.id === selectedContactId);
 
   return (
     <section className="screen chat-screen">
       <div className="chat-title user-title">
-        <div className="avatar">{user.name.slice(0, 1).toUpperCase()}</div>
+        <div className="avatar">{selectedContact ? selectedContact.name.slice(0, 1).toUpperCase() : user.name.slice(0, 1).toUpperCase()}</div>
         <div>
-          <h1>{user.name.split(" ")[0] || "Your"} notes</h1>
-          <p>Record, scan, and receive a warm reply.</p>
+          <h1>{selectedContact ? selectedContact.name : "Your relatives"}</h1>
+          <p>{selectedContact ? "Messages and voice notes" : "Add someone to start talking"}</p>
         </div>
       </div>
 
+      <form className="contact-form" onSubmit={addContact}>
+        <input
+          type="email"
+          placeholder="Relative’s email"
+          value={contactEmail}
+          onChange={(event) => setContactEmail(event.target.value)}
+        />
+        <button>Add</button>
+      </form>
+
+      {contacts.length > 0 && (
+        <div className="contact-strip" aria-label="Relatives">
+          {contacts.map((contact) => (
+            <button
+              key={contact.id}
+              className={contact.id === selectedContactId ? "active" : ""}
+              onClick={() => setSelectedContactId(contact.id)}
+            >
+              {contact.name}
+            </button>
+          ))}
+        </div>
+      )}
+
       <div className="thread">
-        {messages.length === 0 && (
+        {!selectedContact && (
           <article className="empty-state">
-            <strong>A quiet place to start.</strong>
-            <p>Record a short voice note. Lumen will transcribe it, notice speech patterns, and answer warmly.</p>
+            <strong>Add a relative first.</strong>
+            <p>Ask them to create a Lumen account, then add their email here to start a real conversation.</p>
+          </article>
+        )}
+
+        {selectedContact && messages.length === 0 && (
+          <article className="empty-state">
+            <strong>A quiet thread.</strong>
+            <p>Send a text or voice note. Voice notes are scanned gently in the background.</p>
           </article>
         )}
 
         {messages.map((message, index) => (
-          <UserMessage key={message.id} message={message} index={index} />
+          <UserMessage key={message.id} message={message} index={index} currentUserId={user.id} />
         ))}
       </div>
 
@@ -437,30 +528,50 @@ function UserChatScreen({ user }) {
       {isRecording && liveTranscript && <p className="status-note transcript-live">Heard: {liveTranscript}</p>}
       {isProcessing && <p className="status-note">Listening carefully and preparing a reply...</p>}
 
-      <div className="composer">
+      <form className="composer message-composer" onSubmit={sendText}>
         <button className="soft-icon" onClick={clearHistory} aria-label="Clear saved messages">
           ×
         </button>
-        <div className="composer-field">
-          {isRecording ? "Tap Send when you’re ready" : isProcessing ? "Analysing voice note" : "Record a voice note"}
-        </div>
+        <input
+          className="composer-field text-input"
+          value={textDraft}
+          onChange={(event) => setTextDraft(event.target.value)}
+          placeholder={isRecording ? "Tap Send when you’re ready" : isProcessing ? "Analysing voice note" : "Write a message"}
+          disabled={isRecording || isProcessing || !selectedContact}
+        />
+        <button className="send-text-button" disabled={!textDraft.trim() || isRecording || isProcessing || !selectedContact}>
+          Send
+        </button>
         <button
+          type="button"
           className={`record-button ${isRecording ? "recording" : ""}`}
           onClick={isRecording ? stopRecording : startRecording}
-          disabled={isProcessing}
+          disabled={isProcessing || !selectedContact}
           aria-label={isRecording ? "Send voice message" : "Record voice message"}
         >
           {isRecording ? "Send" : "Voice"}
         </button>
-      </div>
+      </form>
     </section>
   );
 }
 
-function UserMessage({ message, index }) {
+function UserMessage({ message, index, currentUserId }) {
+  const isMine = message.fromUserId === currentUserId;
+  if (message.kind === "text") {
+    return (
+      <article className={`message-row ${isMine ? "mine" : "theirs"}`} style={{ animationDelay: `${120 + index * 80}ms` }}>
+        <div className="bubble">
+          <p>{message.text}</p>
+          <time>{formatTime(message.createdAt)}</time>
+        </div>
+      </article>
+    );
+  }
+
   return (
     <>
-      <article className="message-row mine" style={{ animationDelay: `${120 + index * 80}ms` }}>
+      <article className={`message-row ${isMine ? "mine" : "theirs"}`} style={{ animationDelay: `${120 + index * 80}ms` }}>
         <div className={`bubble voice ${message.status === "error" ? "error" : ""}`}>
           <div className="voice-card static">
             <span className="play-dot" />
@@ -475,23 +586,17 @@ function UserMessage({ message, index }) {
 
       {message.status === "complete" && (
         <>
-          <article className="message-row theirs">
+          <article className={`message-row ${isMine ? "mine" : "theirs"}`}>
             <div className="bubble transcript-bubble">
               <strong>Transcript</strong>
               <p>{highlightTranscript(message.transcript, message.analysis?.highlights || [])}</p>
             </div>
           </article>
-          <article className="message-row theirs">
+          <article className={`message-row ${isMine ? "mine" : "theirs"}`}>
             <div className={`bubble analysis-bubble ${message.analysis?.flagged ? "flagged" : ""}`}>
               <strong>{message.analysis?.flagged ? "Worth noticing gently" : "Within today’s baseline"}</strong>
               <p>{message.analysis?.summary}</p>
               <AnalysisSummary analysis={message.analysis} />
-            </div>
-          </article>
-          <article className="message-row theirs">
-            <div className="bubble reply-bubble">
-              <strong>Lumen</strong>
-              <p>{message.reply}</p>
             </div>
           </article>
         </>
@@ -786,11 +891,12 @@ async function parseApiResponse(response) {
   return payload;
 }
 
-async function postVoiceAnalysis(audioBlob, metrics, transcript) {
+async function postVoiceAnalysis(audioBlob, metrics, transcript, toUserId) {
   const formData = new FormData();
   formData.append("audio", audioBlob, "voice-note.webm");
   formData.append("metrics", JSON.stringify(metrics));
   formData.append("transcript", transcript || "");
+  formData.append("toUserId", toUserId);
   return apiPost("/api/analyze-voice", formData);
 }
 

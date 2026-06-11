@@ -94,26 +94,87 @@ app.post("/api/logout", requireAuth, async (req, res) => {
 
 app.get("/api/messages", requireAuth, async (req, res) => {
   const db = await loadDb();
+  const contactId = String(req.query.contactId || "");
+  if (!contactId) return res.status(400).json({ error: "Choose a relative to open the conversation." });
+  if (!usersAreConnected(db, req.user.id, contactId)) {
+    return res.status(403).json({ error: "That conversation is not available." });
+  }
   const messages = db.messages
-    .filter((message) => message.userId === req.user.id)
+    .filter((message) => isThreadMessage(message, req.user.id, contactId))
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
   res.json({ messages });
 });
 
 app.delete("/api/messages", requireAuth, async (req, res) => {
   const db = await loadDb();
-  db.messages = db.messages.filter((message) => message.userId !== req.user.id);
+  db.messages = db.messages.filter((message) => message.fromUserId !== req.user.id && message.toUserId !== req.user.id);
   await saveDb(db);
   res.json({ ok: true });
 });
 
+app.get("/api/contacts", requireAuth, async (req, res) => {
+  const db = await loadDb();
+  res.json({ contacts: buildContacts(db, req.user.id) });
+});
+
+app.post("/api/contacts", requireAuth, async (req, res) => {
+  const email = String(req.body?.email || "").trim().toLowerCase();
+  if (!email) return res.status(400).json({ error: "Enter your relative’s account email." });
+  const db = await loadDb();
+  const relative = db.users.find((user) => user.email === email);
+  if (!relative) return res.status(404).json({ error: "No Lumen account exists for that email yet." });
+  if (relative.id === req.user.id) return res.status(400).json({ error: "Choose someone other than yourself." });
+
+  db.contacts ||= [];
+  if (!usersAreConnected(db, req.user.id, relative.id)) {
+    db.contacts.push({
+      id: crypto.randomUUID(),
+      userId: req.user.id,
+      contactId: relative.id,
+      createdAt: new Date().toISOString(),
+    });
+  }
+  await saveDb(db);
+  res.json({ contacts: buildContacts(db, req.user.id) });
+});
+
+app.post("/api/messages", requireAuth, async (req, res) => {
+  const toUserId = String(req.body?.toUserId || "");
+  const text = String(req.body?.text || "").trim();
+  if (!toUserId || !text) return res.status(400).json({ error: "Choose a relative and write a message." });
+  const db = await loadDb();
+  if (!usersAreConnected(db, req.user.id, toUserId)) {
+    return res.status(403).json({ error: "That conversation is not available." });
+  }
+
+  const message = {
+    id: crypto.randomUUID(),
+    kind: "text",
+    fromUserId: req.user.id,
+    toUserId,
+    createdAt: new Date().toISOString(),
+    text,
+    status: "complete",
+  };
+  db.messages.push(message);
+  await saveDb(db);
+  res.json({ message });
+});
+
 app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, res) => {
   try {
+    const toUserId = String(req.body.toUserId || "");
     const metrics = parseMetrics(req.body.metrics);
     const clientTranscript = String(req.body.transcript || "").trim();
 
+    if (!toUserId) return res.status(400).json({ error: "Choose a relative before sending a voice note." });
     if (!req.file && !clientTranscript) {
       return res.status(400).json({ error: "No audio or browser transcript was received." });
+    }
+
+    const db = await loadDb();
+    if (!usersAreConnected(db, req.user.id, toUserId)) {
+      return res.status(403).json({ error: "That conversation is not available." });
     }
 
     const transcript = await transcribeVoice(req.file, clientTranscript);
@@ -131,9 +192,9 @@ app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, 
     const now = new Date().toISOString();
     const message = {
       id: crypto.randomUUID(),
-      userId: req.user.id,
       kind: "voice",
-      side: "user",
+      fromUserId: req.user.id,
+      toUserId,
       createdAt: now,
       durationMs: metrics.durationMs || 0,
       transcript,
@@ -142,10 +203,9 @@ app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, 
       status: "complete",
     };
 
-    const db = await loadDb();
     db.messages.push(message);
     await saveDb(db);
-    res.json(message);
+    res.json({ message });
   } catch (error) {
     console.error(error);
     res.status(500).json({
@@ -285,13 +345,13 @@ async function requireAuth(req, res, next) {
 async function loadDb() {
   await mkdir(dataDir, { recursive: true });
   if (!existsSync(dataPath)) {
-    return { users: [], sessions: [], messages: [] };
+    return { users: [], sessions: [], messages: [], contacts: [] };
   }
   try {
     const raw = await readFile(dataPath, "utf8");
-    return { users: [], sessions: [], messages: [], ...JSON.parse(raw) };
+    return { users: [], sessions: [], messages: [], contacts: [], ...JSON.parse(raw) };
   } catch {
-    return { users: [], sessions: [], messages: [] };
+    return { users: [], sessions: [], messages: [], contacts: [] };
   }
 }
 
@@ -348,6 +408,40 @@ function readCookie(req, name) {
 
 function publicUser(user) {
   return { id: user.id, name: user.name, email: user.email };
+}
+
+function buildContacts(db, userId) {
+  const connectedIds = new Set();
+  for (const contact of db.contacts || []) {
+    if (contact.userId === userId) connectedIds.add(contact.contactId);
+    if (contact.contactId === userId) connectedIds.add(contact.userId);
+  }
+  for (const message of db.messages || []) {
+    if (message.fromUserId === userId && message.toUserId) connectedIds.add(message.toUserId);
+    if (message.toUserId === userId && message.fromUserId) connectedIds.add(message.fromUserId);
+  }
+  return [...connectedIds]
+    .map((id) => db.users.find((user) => user.id === id))
+    .filter(Boolean)
+    .map(publicUser)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function usersAreConnected(db, userId, contactId) {
+  if (!db.users.some((user) => user.id === contactId)) return false;
+  return (db.contacts || []).some((contact) => {
+    return (
+      (contact.userId === userId && contact.contactId === contactId) ||
+      (contact.userId === contactId && contact.contactId === userId)
+    );
+  });
+}
+
+function isThreadMessage(message, userId, contactId) {
+  return (
+    (message.fromUserId === userId && message.toUserId === contactId) ||
+    (message.fromUserId === contactId && message.toUserId === userId)
+  );
 }
 
 function parseMetrics(value) {
