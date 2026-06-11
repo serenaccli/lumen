@@ -475,7 +475,13 @@ function UserChatScreen({ user }) {
         <div className="avatar">{selectedContact ? selectedContact.name.slice(0, 1).toUpperCase() : user.name.slice(0, 1).toUpperCase()}</div>
         <div>
           <h1>{selectedContact ? selectedContact.name : "Your relatives"}</h1>
-          <p>{selectedContact ? "Messages and voice notes" : "Add someone to start talking"}</p>
+          <p>
+            {selectedContact
+              ? selectedContact.pending
+                ? "Pending invite thread"
+                : "Messages and voice notes"
+              : "Add someone to start talking"}
+          </p>
         </div>
       </div>
 
@@ -498,6 +504,7 @@ function UserChatScreen({ user }) {
               onClick={() => setSelectedContactId(contact.id)}
             >
               {contact.name}
+              {contact.pending ? " · pending" : ""}
             </button>
           ))}
         </div>
@@ -514,7 +521,10 @@ function UserChatScreen({ user }) {
         {selectedContact && messages.length === 0 && (
           <article className="empty-state">
             <strong>A quiet thread.</strong>
-            <p>Send a text or voice note. Voice notes are scanned gently in the background.</p>
+            <p>
+              Send a text or voice note. Voice notes are scanned gently in the background.
+              {selectedContact.pending ? " They will see this thread when they create an account with that email." : ""}
+            </p>
           </article>
         )}
 
@@ -529,7 +539,7 @@ function UserChatScreen({ user }) {
       {isProcessing && <p className="status-note">Listening carefully and preparing a reply...</p>}
 
       <form className="composer message-composer" onSubmit={sendText}>
-        <button className="soft-icon" onClick={clearHistory} aria-label="Clear saved messages">
+        <button type="button" className="soft-icon" onClick={clearHistory} aria-label="Clear saved messages">
           ×
         </button>
         <input

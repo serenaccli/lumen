@@ -63,6 +63,7 @@ app.post("/api/register", async (req, res) => {
     createdAt: new Date().toISOString(),
   };
   db.users.push(user);
+  attachPendingContacts(db, user);
   const session = createSession(db, user.id);
   await saveDb(db);
   setSessionCookie(res, session.token);
@@ -96,11 +97,12 @@ app.get("/api/messages", requireAuth, async (req, res) => {
   const db = await loadDb();
   const contactId = String(req.query.contactId || "");
   if (!contactId) return res.status(400).json({ error: "Choose a relative to open the conversation." });
-  if (!usersAreConnected(db, req.user.id, contactId)) {
+  const conversation = resolveConversation(db, req.user.id, contactId);
+  if (!conversation) {
     return res.status(403).json({ error: "That conversation is not available." });
   }
   const messages = db.messages
-    .filter((message) => isThreadMessage(message, req.user.id, contactId))
+    .filter((message) => isThreadMessage(message, req.user.id, conversation))
     .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
   res.json({ messages });
 });
@@ -122,15 +124,24 @@ app.post("/api/contacts", requireAuth, async (req, res) => {
   if (!email) return res.status(400).json({ error: "Enter your relative’s account email." });
   const db = await loadDb();
   const relative = db.users.find((user) => user.email === email);
-  if (!relative) return res.status(404).json({ error: "No Lumen account exists for that email yet." });
-  if (relative.id === req.user.id) return res.status(400).json({ error: "Choose someone other than yourself." });
+  if (relative?.id === req.user.id) return res.status(400).json({ error: "Choose someone other than yourself." });
 
   db.contacts ||= [];
-  if (!usersAreConnected(db, req.user.id, relative.id)) {
+  const existing = db.contacts.find((contact) => {
+    return (
+      (relative &&
+        ((contact.userId === req.user.id && contact.contactId === relative.id) ||
+          (contact.userId === relative.id && contact.contactId === req.user.id))) ||
+      (contact.userId === req.user.id && contact.pendingEmail === email)
+    );
+  });
+  if (!existing) {
     db.contacts.push({
       id: crypto.randomUUID(),
       userId: req.user.id,
-      contactId: relative.id,
+      contactId: relative?.id || null,
+      pendingEmail: relative ? null : email,
+      pendingName: relative ? null : nameFromEmail(email),
       createdAt: new Date().toISOString(),
     });
   }
@@ -143,7 +154,8 @@ app.post("/api/messages", requireAuth, async (req, res) => {
   const text = String(req.body?.text || "").trim();
   if (!toUserId || !text) return res.status(400).json({ error: "Choose a relative and write a message." });
   const db = await loadDb();
-  if (!usersAreConnected(db, req.user.id, toUserId)) {
+  const conversation = resolveConversation(db, req.user.id, toUserId);
+  if (!conversation) {
     return res.status(403).json({ error: "That conversation is not available." });
   }
 
@@ -151,7 +163,9 @@ app.post("/api/messages", requireAuth, async (req, res) => {
     id: crypto.randomUUID(),
     kind: "text",
     fromUserId: req.user.id,
-    toUserId,
+    toUserId: conversation.contactUserId,
+    pendingContactId: conversation.pendingContactId,
+    toEmail: conversation.pendingEmail,
     createdAt: new Date().toISOString(),
     text,
     status: "complete",
@@ -173,7 +187,8 @@ app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, 
     }
 
     const db = await loadDb();
-    if (!usersAreConnected(db, req.user.id, toUserId)) {
+    const conversation = resolveConversation(db, req.user.id, toUserId);
+    if (!conversation) {
       return res.status(403).json({ error: "That conversation is not available." });
     }
 
@@ -194,7 +209,9 @@ app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, 
       id: crypto.randomUUID(),
       kind: "voice",
       fromUserId: req.user.id,
-      toUserId,
+      toUserId: conversation.contactUserId,
+      pendingContactId: conversation.pendingContactId,
+      toEmail: conversation.pendingEmail,
       createdAt: now,
       durationMs: metrics.durationMs || 0,
       transcript,
@@ -411,37 +428,103 @@ function publicUser(user) {
 }
 
 function buildContacts(db, userId) {
-  const connectedIds = new Set();
+  const contacts = [];
+  const seen = new Set();
   for (const contact of db.contacts || []) {
-    if (contact.userId === userId) connectedIds.add(contact.contactId);
-    if (contact.contactId === userId) connectedIds.add(contact.userId);
+    if (contact.userId === userId) {
+      if (contact.contactId) {
+        const user = db.users.find((candidate) => candidate.id === contact.contactId);
+        if (user && !seen.has(user.id)) {
+          contacts.push(publicUser(user));
+          seen.add(user.id);
+        }
+      } else if (contact.pendingEmail && !seen.has(contact.id)) {
+        contacts.push({
+          id: contact.id,
+          name: contact.pendingName || nameFromEmail(contact.pendingEmail),
+          email: contact.pendingEmail,
+          pending: true,
+        });
+        seen.add(contact.id);
+      }
+    }
+    if (contact.contactId === userId) {
+      const user = db.users.find((candidate) => candidate.id === contact.userId);
+      if (user && !seen.has(user.id)) {
+        contacts.push(publicUser(user));
+        seen.add(user.id);
+      }
+    }
   }
   for (const message of db.messages || []) {
-    if (message.fromUserId === userId && message.toUserId) connectedIds.add(message.toUserId);
-    if (message.toUserId === userId && message.fromUserId) connectedIds.add(message.fromUserId);
+    if (message.fromUserId === userId && message.toUserId && !seen.has(message.toUserId)) {
+      const user = db.users.find((candidate) => candidate.id === message.toUserId);
+      if (user) {
+        contacts.push(publicUser(user));
+        seen.add(user.id);
+      }
+    }
+    if (message.toUserId === userId && message.fromUserId && !seen.has(message.fromUserId)) {
+      const user = db.users.find((candidate) => candidate.id === message.fromUserId);
+      if (user) {
+        contacts.push(publicUser(user));
+        seen.add(user.id);
+      }
+    }
   }
-  return [...connectedIds]
-    .map((id) => db.users.find((user) => user.id === id))
-    .filter(Boolean)
-    .map(publicUser)
-    .sort((a, b) => a.name.localeCompare(b.name));
+  return contacts.sort((a, b) => a.name.localeCompare(b.name));
 }
 
-function usersAreConnected(db, userId, contactId) {
-  if (!db.users.some((user) => user.id === contactId)) return false;
-  return (db.contacts || []).some((contact) => {
+function resolveConversation(db, userId, targetId) {
+  const contact = (db.contacts || []).find((candidate) => {
     return (
-      (contact.userId === userId && contact.contactId === contactId) ||
-      (contact.userId === contactId && contact.contactId === userId)
+      (candidate.userId === userId && (candidate.contactId === targetId || candidate.id === targetId)) ||
+      (candidate.contactId === userId && candidate.userId === targetId)
     );
   });
+  if (!contact) return null;
+  const otherUserId = contact.userId === userId ? contact.contactId : contact.userId;
+  return {
+    contactRecordId: contact.id,
+    contactUserId: otherUserId || null,
+    pendingContactId: otherUserId ? null : contact.id,
+    pendingEmail: otherUserId ? null : contact.pendingEmail,
+  };
 }
 
-function isThreadMessage(message, userId, contactId) {
+function isThreadMessage(message, userId, conversation) {
+  if (conversation.pendingContactId) {
+    return message.fromUserId === userId && message.pendingContactId === conversation.pendingContactId;
+  }
   return (
-    (message.fromUserId === userId && message.toUserId === contactId) ||
-    (message.fromUserId === contactId && message.toUserId === userId)
+    (message.fromUserId === userId && message.toUserId === conversation.contactUserId) ||
+    (message.fromUserId === conversation.contactUserId && message.toUserId === userId)
   );
+}
+
+function attachPendingContacts(db, user) {
+  for (const contact of db.contacts || []) {
+    if (!contact.contactId && contact.pendingEmail === user.email) {
+      contact.contactId = user.id;
+      contact.pendingEmail = null;
+      contact.pendingName = null;
+    }
+  }
+  for (const message of db.messages || []) {
+    if (!message.toUserId && message.toEmail === user.email) {
+      message.toUserId = user.id;
+      message.pendingContactId = null;
+    }
+  }
+}
+
+function nameFromEmail(email) {
+  const local = String(email).split("@")[0] || "Relative";
+  return local
+    .split(/[._-]+/)
+    .filter(Boolean)
+    .map((part) => part.slice(0, 1).toUpperCase() + part.slice(1))
+    .join(" ");
 }
 
 function parseMetrics(value) {
