@@ -2,7 +2,6 @@ import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "./styles.css";
 
-const STORAGE_KEY = "lumen.voice.messages.v1";
 const MAX_RECORDING_MS = 60_000;
 
 const exampleMessages = [
@@ -87,14 +86,41 @@ const weeklyTrend = [
 ];
 
 function App() {
+  const [user, setUser] = useState(null);
+  const [booting, setBooting] = useState(true);
   const [view, setView] = useState("user");
   const [screen, setScreen] = useState("chat");
   const [selected, setSelected] = useState(exampleMessages.find((message) => message.flagged));
   const exampleFlagged = useMemo(() => exampleMessages.filter((message) => message.flagged), []);
 
+  useEffect(() => {
+    apiGet("/api/me")
+      .then((payload) => setUser(payload.user))
+      .catch(() => setUser(null))
+      .finally(() => setBooting(false));
+  }, []);
+
   function switchView(nextView) {
     setView(nextView);
     setScreen("chat");
+  }
+
+  async function logout() {
+    await apiPost("/api/logout");
+    setUser(null);
+    setView("user");
+    setScreen("chat");
+  }
+
+  if (booting) {
+    return (
+      <main className="app-shell">
+        <section className="phone-frame loading-frame">
+          <div className="opening-glow" />
+          <div className="center-note">Opening Lumen...</div>
+        </section>
+      </main>
+    );
   }
 
   return (
@@ -135,7 +161,9 @@ function App() {
           </button>
         </nav>
 
-        {screen === "chat" && view === "user" && <UserChatScreen />}
+        {screen === "chat" && view === "user" && (
+          user ? <UserChatScreen user={user} /> : <AuthScreen onAuthed={setUser} />
+        )}
         {screen === "chat" && view === "example" && (
           <ExampleChatScreen
             messages={exampleMessages}
@@ -157,29 +185,110 @@ function App() {
         {screen === "detail" && selected && (
           <DetailScreen message={selected} onBack={() => setScreen(view === "example" ? "dashboard" : "chat")} />
         )}
-        {screen === "settings" && <SettingsScreen view={view} />}
+        {screen === "settings" && <SettingsScreen user={user} view={view} onLogout={logout} />}
       </section>
     </main>
   );
 }
 
-function UserChatScreen() {
-  const [messages, setMessages] = useLocalMessages();
+function AuthScreen({ onAuthed }) {
+  const [mode, setMode] = useState("register");
+  const [form, setForm] = useState({ name: "", email: "", password: "" });
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      const payload = await apiPost(mode === "register" ? "/api/register" : "/api/login", form);
+      onAuthed(payload.user);
+    } catch (apiError) {
+      setError(apiError.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <section className="screen auth-screen">
+      <div className="section-heading">
+        <h1>{mode === "register" ? "Create your account" : "Welcome back"}</h1>
+        <p>Your messages and scans are saved privately on this Lumen server.</p>
+      </div>
+      <form className="auth-form" onSubmit={submit}>
+        {mode === "register" && (
+          <label>
+            <span>Name</span>
+            <input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} />
+          </label>
+        )}
+        <label>
+          <span>Email</span>
+          <input
+            type="email"
+            autoComplete="email"
+            value={form.email}
+            onChange={(event) => setForm({ ...form, email: event.target.value })}
+          />
+        </label>
+        <label>
+          <span>Password</span>
+          <input
+            type="password"
+            autoComplete={mode === "register" ? "new-password" : "current-password"}
+            value={form.password}
+            onChange={(event) => setForm({ ...form, password: event.target.value })}
+          />
+        </label>
+        {error && <p className="status-note alert">{error}</p>}
+        <button className="primary-action" disabled={busy}>
+          {busy ? "Please wait..." : mode === "register" ? "Create account" : "Sign in"}
+        </button>
+      </form>
+      <button className="link-button" onClick={() => setMode(mode === "register" ? "login" : "register")}>
+        {mode === "register" ? "I already have an account" : "Create a new account"}
+      </button>
+    </section>
+  );
+}
+
+function UserChatScreen({ user }) {
+  const [messages, setMessages] = useState([]);
   const [status, setStatus] = useState("idle");
   const [elapsedMs, setElapsedMs] = useState(0);
   const [error, setError] = useState("");
+  const [liveTranscript, setLiveTranscript] = useState("");
   const mediaRecorderRef = useRef(null);
+  const recognitionRef = useRef(null);
   const streamRef = useRef(null);
   const chunksRef = useRef([]);
   const startedAtRef = useRef(0);
   const timerRef = useRef(null);
+  const transcriptRef = useRef("");
 
   useEffect(() => {
-    return () => stopMediaTracks(streamRef.current);
+    reloadMessages();
+    return () => {
+      stopMediaTracks(streamRef.current);
+      stopRecognition(recognitionRef.current);
+    };
   }, []);
+
+  async function reloadMessages() {
+    try {
+      const payload = await apiGet("/api/messages");
+      setMessages(payload.messages || []);
+    } catch (apiError) {
+      setError(apiError.message);
+    }
+  }
 
   async function startRecording() {
     setError("");
+    setLiveTranscript("");
+    transcriptRef.current = "";
     if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder) {
       setError("This browser cannot record audio here. Try a recent Chrome, Edge, or Safari build.");
       return;
@@ -194,6 +303,7 @@ function UserChatScreen() {
       startedAtRef.current = Date.now();
       setElapsedMs(0);
       setStatus("recording");
+      startSpeechRecognition();
 
       recorder.ondataavailable = (event) => {
         if (event.data.size > 0) chunksRef.current.push(event.data);
@@ -215,8 +325,29 @@ function UserChatScreen() {
     }
   }
 
+  function startSpeechRecognition() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return;
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = "en-US";
+    recognition.onresult = (event) => {
+      let nextTranscript = "";
+      for (let index = 0; index < event.results.length; index += 1) {
+        nextTranscript += event.results[index][0].transcript;
+      }
+      transcriptRef.current = nextTranscript.trim();
+      setLiveTranscript(transcriptRef.current);
+    };
+    recognition.onerror = () => {};
+    recognitionRef.current = recognition;
+    recognition.start();
+  }
+
   async function stopRecording() {
     if (timerRef.current) window.clearInterval(timerRef.current);
+    stopRecognition(recognitionRef.current);
     const recorder = mediaRecorderRef.current;
     if (!recorder || recorder.state === "inactive") return;
 
@@ -236,37 +367,23 @@ function UserChatScreen() {
       createdAt: new Date().toISOString(),
       durationMs,
       status: "processing",
-      transcript: "",
+      transcript: transcriptRef.current,
       reply: "",
       analysis: null,
-      localAudioUrl: URL.createObjectURL(audioBlob),
     };
 
     setMessages((current) => [...current, localMessage]);
     setStatus("processing");
-    await analyseVoiceNote(audioBlob, durationMs, localId);
+    await analyseVoiceNote(audioBlob, durationMs, localId, transcriptRef.current);
   }
 
-  async function analyseVoiceNote(audioBlob, durationMs, localId) {
+  async function analyseVoiceNote(audioBlob, durationMs, localId, browserTranscript) {
     try {
       const metrics = await estimateAudioMetrics(audioBlob, durationMs);
-      const result = await postVoiceAnalysis(audioBlob, { ...metrics, durationMs });
-      setMessages((current) =>
-        current.map((message) =>
-          message.id === localId
-            ? {
-                ...message,
-                ...result,
-                id: localId,
-                durationMs,
-                status: "complete",
-                createdAt: message.createdAt,
-                localAudioUrl: message.localAudioUrl,
-              }
-            : message,
-        ),
-      );
+      const result = await postVoiceAnalysis(audioBlob, { ...metrics, durationMs }, browserTranscript);
+      setMessages((current) => current.map((message) => (message.id === localId ? result : message)));
       setStatus("idle");
+      setLiveTranscript("");
     } catch (apiError) {
       setMessages((current) =>
         current.map((message) =>
@@ -283,10 +400,8 @@ function UserChatScreen() {
     }
   }
 
-  function clearHistory() {
-    messages.forEach((message) => {
-      if (message.localAudioUrl) URL.revokeObjectURL(message.localAudioUrl);
-    });
+  async function clearHistory() {
+    await apiDelete("/api/messages");
     setMessages([]);
     setError("");
   }
@@ -297,10 +412,10 @@ function UserChatScreen() {
   return (
     <section className="screen chat-screen">
       <div className="chat-title user-title">
-        <div className="avatar">Y</div>
+        <div className="avatar">{user.name.slice(0, 1).toUpperCase()}</div>
         <div>
-          <h1>Your voice notes</h1>
-          <p>Record, reflect, and receive a warm reply.</p>
+          <h1>{user.name.split(" ")[0] || "Your"} notes</h1>
+          <p>Record, scan, and receive a warm reply.</p>
         </div>
       </div>
 
@@ -319,10 +434,11 @@ function UserChatScreen() {
 
       {error && <p className="status-note alert">{error}</p>}
       {isRecording && <p className="status-note">Recording {formatDuration(elapsedMs)} of 1:00</p>}
+      {isRecording && liveTranscript && <p className="status-note transcript-live">Heard: {liveTranscript}</p>}
       {isProcessing && <p className="status-note">Listening carefully and preparing a reply...</p>}
 
       <div className="composer">
-        <button className="soft-icon" onClick={clearHistory} aria-label="Clear local history">
+        <button className="soft-icon" onClick={clearHistory} aria-label="Clear saved messages">
           ×
         </button>
         <div className="composer-field">
@@ -584,30 +700,45 @@ function DetailScreen({ message, onBack }) {
   );
 }
 
-function SettingsScreen({ view }) {
-  const [messages, setMessages] = useLocalMessages();
+function SettingsScreen({ user, view, onLogout }) {
+  async function clearHistory() {
+    await apiDelete("/api/messages");
+  }
+
   return (
     <section className="screen settings-screen">
       <div className="section-heading">
         <h1>Settings</h1>
-        <p>{view === "user" ? "Local history and analysis preferences." : "Example visibility and sensitivity."}</p>
+        <p>{view === "user" ? "Account and analysis preferences." : "Example visibility and sensitivity."}</p>
       </div>
 
       <section className="settings-list">
         <label className="setting-row">
           <span>
-            <strong>Consent for local voice analysis</strong>
-            <small>Recordings are analysed when you send them. History stays in this browser.</small>
+            <strong>Consent for voice analysis</strong>
+            <small>Recordings are analysed when you send them. Message results are saved to your account.</small>
           </span>
           <input type="checkbox" defaultChecked />
         </label>
 
+        {user && (
+          <div className="setting-row">
+            <span>
+              <strong>{user.name}</strong>
+              <small>{user.email}</small>
+            </span>
+            <button className="small-button" onClick={onLogout}>
+              Sign out
+            </button>
+          </div>
+        )}
+
         <div className="setting-row">
           <span>
             <strong>Saved voice notes</strong>
-            <small>{messages.length} local item{messages.length === 1 ? "" : "s"}</small>
+            <small>Clear this account’s saved message history.</small>
           </span>
-          <button className="small-button" onClick={() => setMessages([])}>
+          <button className="small-button" onClick={clearHistory} disabled={!user}>
             Clear
           </button>
         </div>
@@ -629,42 +760,38 @@ function SettingsScreen({ view }) {
   );
 }
 
-function useLocalMessages() {
-  const [messages, setMessagesState] = useState(() => {
-    try {
-      return JSON.parse(localStorage.getItem(STORAGE_KEY) || "[]");
-    } catch {
-      return [];
-    }
-  });
-
-  const setMessages = (next) => {
-    setMessagesState((current) => {
-      const resolved = typeof next === "function" ? next(current) : next;
-      const persistable = resolved.map(({ localAudioUrl, ...message }) => message);
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(persistable));
-      return resolved;
-    });
-  };
-
-  return [messages, setMessages];
+async function apiGet(path) {
+  const response = await fetch(path, { credentials: "same-origin" });
+  return parseApiResponse(response);
 }
 
-async function postVoiceAnalysis(audioBlob, metrics) {
+async function apiPost(path, body) {
+  const response = await fetch(path, {
+    method: "POST",
+    headers: body instanceof FormData ? undefined : { "Content-Type": "application/json" },
+    credentials: "same-origin",
+    body: body instanceof FormData ? body : JSON.stringify(body || {}),
+  });
+  return parseApiResponse(response);
+}
+
+async function apiDelete(path) {
+  const response = await fetch(path, { method: "DELETE", credentials: "same-origin" });
+  return parseApiResponse(response);
+}
+
+async function parseApiResponse(response) {
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.error || "Something went quiet. Please try again.");
+  return payload;
+}
+
+async function postVoiceAnalysis(audioBlob, metrics, transcript) {
   const formData = new FormData();
   formData.append("audio", audioBlob, "voice-note.webm");
   formData.append("metrics", JSON.stringify(metrics));
-
-  const response = await fetch("/api/analyze-voice", {
-    method: "POST",
-    body: formData,
-  });
-
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(payload.error || "Analysis could not finish. Please try again.");
-  }
-  return payload;
+  formData.append("transcript", transcript || "");
+  return apiPost("/api/analyze-voice", formData);
 }
 
 async function estimateAudioMetrics(audioBlob, durationMs) {
@@ -705,7 +832,7 @@ async function estimateAudioMetrics(audioBlob, durationMs) {
 
 function highlightTranscript(text, highlights) {
   if (!highlights?.length) return text;
-  let remaining = text;
+  let remaining = text || "";
   const parts = [];
   highlights.forEach((highlight) => {
     const index = remaining.toLowerCase().indexOf(String(highlight).toLowerCase());
@@ -725,6 +852,14 @@ function preferredMimeType() {
 
 function stopMediaTracks(stream) {
   stream?.getTracks().forEach((track) => track.stop());
+}
+
+function stopRecognition(recognition) {
+  try {
+    recognition?.stop();
+  } catch {
+    // Recognition may already be stopped.
+  }
 }
 
 function formatDuration(ms = 0) {

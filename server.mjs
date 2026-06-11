@@ -3,6 +3,9 @@ import express from "express";
 import multer from "multer";
 import OpenAI, { toFile } from "openai";
 import { createServer as createViteServer } from "vite";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import crypto from "node:crypto";
 
 const app = express();
 const upload = multer({
@@ -11,49 +14,142 @@ const upload = multer({
 });
 
 const port = Number(process.env.PORT || 5173);
+const host = process.env.HOST || (process.env.NODE_ENV === "production" ? "0.0.0.0" : "127.0.0.1");
 const isProduction = process.env.NODE_ENV === "production";
 const transcribeModel = process.env.OPENAI_TRANSCRIBE_MODEL || "gpt-4o-mini-transcribe";
-const textModel = process.env.OPENAI_TEXT_MODEL || "gpt-5-nano";
+const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
+const openaiTextModel = process.env.OPENAI_TEXT_MODEL || "gpt-5-nano";
+const dataDir = process.env.DATA_DIR || "data";
+const dataPath = `${dataDir}/lumen.json`;
+
+const openaiClient = process.env.OPENAI_API_KEY
+  ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+  : null;
+const deepseekClient = process.env.DEEPSEEK_API_KEY
+  ? new OpenAI({ apiKey: process.env.DEEPSEEK_API_KEY, baseURL: "https://api.deepseek.com" })
+  : null;
 
 app.use(express.json({ limit: "1mb" }));
 
-app.post("/api/analyze-voice", requireOpenAIKey, upload.single("audio"), async (req, res) => {
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    transcription: openaiClient ? "openai" : "browser-speech",
+    analysis: deepseekClient ? "deepseek" : openaiClient ? "openai" : "heuristic",
+  });
+});
+
+app.get("/api/me", requireAuth, (req, res) => {
+  res.json({ user: publicUser(req.user) });
+});
+
+app.post("/api/register", async (req, res) => {
+  const { name, email, password } = req.body || {};
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  if (!name || !normalizedEmail || !password || String(password).length < 8) {
+    return res.status(400).json({ error: "Please enter a name, email, and password of at least 8 characters." });
+  }
+
+  const db = await loadDb();
+  if (db.users.some((user) => user.email === normalizedEmail)) {
+    return res.status(409).json({ error: "An account already exists for that email." });
+  }
+
+  const user = {
+    id: crypto.randomUUID(),
+    name: String(name).trim(),
+    email: normalizedEmail,
+    password: hashPassword(password),
+    createdAt: new Date().toISOString(),
+  };
+  db.users.push(user);
+  const session = createSession(db, user.id);
+  await saveDb(db);
+  setSessionCookie(res, session.token);
+  res.json({ user: publicUser(user) });
+});
+
+app.post("/api/login", async (req, res) => {
+  const { email, password } = req.body || {};
+  const normalizedEmail = String(email || "").trim().toLowerCase();
+  const db = await loadDb();
+  const user = db.users.find((candidate) => candidate.email === normalizedEmail);
+  if (!user || !verifyPassword(password, user.password)) {
+    return res.status(401).json({ error: "That email and password did not match." });
+  }
+
+  const session = createSession(db, user.id);
+  await saveDb(db);
+  setSessionCookie(res, session.token);
+  res.json({ user: publicUser(user) });
+});
+
+app.post("/api/logout", requireAuth, async (req, res) => {
+  const db = await loadDb();
+  db.sessions = db.sessions.filter((session) => session.token !== req.sessionToken);
+  await saveDb(db);
+  clearSessionCookie(res);
+  res.json({ ok: true });
+});
+
+app.get("/api/messages", requireAuth, async (req, res) => {
+  const db = await loadDb();
+  const messages = db.messages
+    .filter((message) => message.userId === req.user.id)
+    .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt));
+  res.json({ messages });
+});
+
+app.delete("/api/messages", requireAuth, async (req, res) => {
+  const db = await loadDb();
+  db.messages = db.messages.filter((message) => message.userId !== req.user.id);
+  await saveDb(db);
+  res.json({ ok: true });
+});
+
+app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No audio file was received." });
+    const metrics = parseMetrics(req.body.metrics);
+    const clientTranscript = String(req.body.transcript || "").trim();
+
+    if (!req.file && !clientTranscript) {
+      return res.status(400).json({ error: "No audio or browser transcript was received." });
     }
 
-    const metrics = parseMetrics(req.body.metrics);
-    const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
-    const audioFile = await toFile(req.file.buffer, req.file.originalname || "voice-note.webm", {
-      type: req.file.mimetype || "audio/webm",
-    });
+    const transcript = await transcribeVoice(req.file, clientTranscript);
+    if (!transcript) {
+      return res.status(400).json({
+        error:
+          "I could not make out a transcript. Try recording in Chrome or Safari with speech recognition enabled, or configure OpenAI transcription.",
+      });
+    }
 
-    const transcription = await client.audio.transcriptions.create({
-      file: audioFile,
-      model: transcribeModel,
-      prompt:
-        "This is a warm family voice note. Preserve hesitations, fillers, repeated attempts, and unfinished phrases where possible.",
-    });
-
-    const transcript = normalizeTranscript(transcription);
     const deterministic = buildDeterministicAnalysis(transcript, metrics);
-    const refined = await refineAnalysis(client, transcript, deterministic);
+    const refined = await refineAnalysis(transcript, deterministic);
     const analysis = mergeAnalysis(deterministic, refined);
-    const reply = await generateWarmReply(client, transcript, analysis);
-
-    res.json({
+    const reply = await generateWarmReply(transcript, analysis, req.user);
+    const now = new Date().toISOString();
+    const message = {
       id: crypto.randomUUID(),
-      createdAt: new Date().toISOString(),
+      userId: req.user.id,
+      kind: "voice",
+      side: "user",
+      createdAt: now,
       durationMs: metrics.durationMs || 0,
       transcript,
       analysis,
       reply,
-    });
+      status: "complete",
+    };
+
+    const db = await loadDb();
+    db.messages.push(message);
+    await saveDb(db);
+    res.json(message);
   } catch (error) {
     console.error(error);
     res.status(500).json({
-      error: "The voice note was saved, but analysis could not finish. Please try again when the connection feels steadier.",
+      error: "The voice note was saved locally, but analysis could not finish. Please try again when the connection feels steadier.",
     });
   }
 });
@@ -63,23 +159,195 @@ if (isProduction) {
   app.get(/.*/, (_req, res) => res.sendFile(new URL("./dist/index.html", import.meta.url).pathname));
 } else {
   const vite = await createViteServer({
-    server: { middlewareMode: true, host: "127.0.0.1" },
+    server: { middlewareMode: true, host },
     appType: "spa",
   });
   app.use(vite.middlewares);
 }
 
-app.listen(port, "127.0.0.1", () => {
-  console.log(`Lumen running at http://127.0.0.1:${port}/`);
+app.listen(port, host, () => {
+  console.log(`Lumen running at http://${host}:${port}/`);
 });
 
-function requireOpenAIKey(_req, res, next) {
-  if (!process.env.OPENAI_API_KEY) {
-    return res.status(500).json({
-      error: "OpenAI is not configured yet. Add OPENAI_API_KEY to .env, then restart the dev server.",
+async function transcribeVoice(file, clientTranscript) {
+  if (openaiClient && file) {
+    const audioFile = await toFile(file.buffer, file.originalname || "voice-note.webm", {
+      type: file.mimetype || "audio/webm",
     });
+    const transcription = await openaiClient.audio.transcriptions.create({
+      file: audioFile,
+      model: transcribeModel,
+      prompt:
+        "This is a warm family voice note. Preserve hesitations, fillers, repeated attempts, and unfinished phrases where possible.",
+    });
+    return normalizeTranscript(transcription) || clientTranscript;
   }
+  return clientTranscript;
+}
+
+async function refineAnalysis(transcript, deterministic) {
+  const prompt = JSON.stringify({
+    transcript,
+    deterministic,
+    instructions:
+      "Return JSON with keys summary, patterns, highlights, flagged, baselineComparison. Use gentle, non-diagnostic language. Highlights must be exact transcript substrings.",
+  });
+
+  if (deepseekClient) {
+    const response = await deepseekClient.chat.completions.create({
+      model: deepseekModel,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You analyse voice-note transcripts for possible word-finding patterns. You are not diagnosing. Return only compact JSON.",
+        },
+        { role: "user", content: prompt },
+      ],
+      stream: false,
+    });
+    return parseJsonObject(response.choices?.[0]?.message?.content);
+  }
+
+  if (openaiClient) {
+    const response = await openaiClient.responses.create({
+      model: openaiTextModel,
+      input: [
+        {
+          role: "system",
+          content:
+            "You analyse voice-note transcripts for possible word-finding patterns. You are not diagnosing. Return only compact JSON.",
+        },
+        { role: "user", content: prompt },
+      ],
+      max_output_tokens: 500,
+    });
+    return parseJsonObject(response.output_text);
+  }
+
+  return {};
+}
+
+async function generateWarmReply(transcript, analysis, user) {
+  const prompt = JSON.stringify({ transcript, analysisSummary: analysis.summary, firstName: user.name.split(" ")[0] });
+
+  if (deepseekClient) {
+    const response = await deepseekClient.chat.completions.create({
+      model: deepseekModel,
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are a warm family conversation partner. Reply to the user's voice note in one or two short, natural sentences. Do not mention monitoring, aphasia, analysis, diagnosis, or therapy.",
+        },
+        { role: "user", content: prompt },
+      ],
+      stream: false,
+    });
+    return response.choices?.[0]?.message?.content?.trim() || "I hear you. Thank you for telling me.";
+  }
+
+  if (openaiClient) {
+    const response = await openaiClient.responses.create({
+      model: openaiTextModel,
+      input: [
+        {
+          role: "system",
+          content:
+            "You are a warm family conversation partner. Reply to the user's voice note in one or two short, natural sentences. Do not mention monitoring, aphasia, analysis, diagnosis, or therapy.",
+        },
+        { role: "user", content: prompt },
+      ],
+      max_output_tokens: 140,
+    });
+    return response.output_text?.trim() || "I hear you. Thank you for telling me.";
+  }
+
+  return "I hear you. Thank you for telling me.";
+}
+
+async function requireAuth(req, res, next) {
+  const token = readCookie(req, "lumen_session");
+  if (!token) return res.status(401).json({ error: "Please sign in to continue." });
+  const db = await loadDb();
+  const session = db.sessions.find((candidate) => candidate.token === token && new Date(candidate.expiresAt) > new Date());
+  if (!session) {
+    clearSessionCookie(res);
+    return res.status(401).json({ error: "Please sign in to continue." });
+  }
+  const user = db.users.find((candidate) => candidate.id === session.userId);
+  if (!user) return res.status(401).json({ error: "Please sign in to continue." });
+  req.user = user;
+  req.sessionToken = token;
   next();
+}
+
+async function loadDb() {
+  await mkdir(dataDir, { recursive: true });
+  if (!existsSync(dataPath)) {
+    return { users: [], sessions: [], messages: [] };
+  }
+  try {
+    const raw = await readFile(dataPath, "utf8");
+    return { users: [], sessions: [], messages: [], ...JSON.parse(raw) };
+  } catch {
+    return { users: [], sessions: [], messages: [] };
+  }
+}
+
+async function saveDb(db) {
+  await mkdir(dataDir, { recursive: true });
+  const nextDb = {
+    ...db,
+    sessions: db.sessions.filter((session) => new Date(session.expiresAt) > new Date()),
+  };
+  await writeFile(dataPath, JSON.stringify(nextDb, null, 2));
+}
+
+function createSession(db, userId) {
+  const session = {
+    token: crypto.randomBytes(32).toString("hex"),
+    userId,
+    createdAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 1000 * 60 * 60 * 24 * 30).toISOString(),
+  };
+  db.sessions.push(session);
+  return session;
+}
+
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString("hex");
+  const hash = crypto.pbkdf2Sync(String(password), salt, 210_000, 32, "sha256").toString("hex");
+  return `pbkdf2_sha256$${salt}$${hash}`;
+}
+
+function verifyPassword(password, stored) {
+  const [, salt, hash] = String(stored || "").split("$");
+  if (!salt || !hash) return false;
+  const candidate = crypto.pbkdf2Sync(String(password), salt, 210_000, 32, "sha256").toString("hex");
+  return crypto.timingSafeEqual(Buffer.from(hash, "hex"), Buffer.from(candidate, "hex"));
+}
+
+function setSessionCookie(res, token) {
+  const secure = process.env.COOKIE_SECURE === "true" || process.env.NODE_ENV === "production";
+  res.setHeader(
+    "Set-Cookie",
+    `lumen_session=${token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${60 * 60 * 24 * 30}${secure ? "; Secure" : ""}`,
+  );
+}
+
+function clearSessionCookie(res) {
+  res.setHeader("Set-Cookie", "lumen_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0");
+}
+
+function readCookie(req, name) {
+  const cookies = String(req.headers.cookie || "").split(";").map((cookie) => cookie.trim());
+  const match = cookies.find((cookie) => cookie.startsWith(`${name}=`));
+  return match ? decodeURIComponent(match.slice(name.length + 1)) : "";
+}
+
+function publicUser(user) {
+  return { id: user.id, name: user.name, email: user.email };
 }
 
 function parseMetrics(value) {
@@ -147,51 +415,6 @@ function buildDeterministicAnalysis(transcript, metrics) {
     disfluencyRate,
     baselineComparison: disfluencyRate > 0.06 ? "above-baseline" : "within-baseline",
   };
-}
-
-async function refineAnalysis(client, transcript, deterministic) {
-  const response = await client.responses.create({
-    model: textModel,
-    input: [
-      {
-        role: "system",
-        content:
-          "You analyse voice-note transcripts for possible word-finding patterns. You are not diagnosing. Return only compact JSON.",
-      },
-      {
-        role: "user",
-        content: JSON.stringify({
-          transcript,
-          deterministic,
-          instructions:
-            "Return JSON with keys summary, patterns, highlights, flagged, baselineComparison. Use gentle, non-diagnostic language. Highlights must be exact transcript substrings.",
-        }),
-      },
-    ],
-    max_output_tokens: 500,
-  });
-
-  return parseJsonObject(response.output_text);
-}
-
-async function generateWarmReply(client, transcript, analysis) {
-  const response = await client.responses.create({
-    model: textModel,
-    input: [
-      {
-        role: "system",
-        content:
-          "You are a warm family conversation partner. Reply to the user's voice note in one or two short, natural sentences. Do not mention monitoring, aphasia, analysis, diagnosis, or therapy.",
-      },
-      {
-        role: "user",
-        content: JSON.stringify({ transcript, analysisSummary: analysis.summary }),
-      },
-    ],
-    max_output_tokens: 140,
-  });
-
-  return response.output_text?.trim() || "I hear you. Thank you for telling me.";
 }
 
 function parseJsonObject(text) {
