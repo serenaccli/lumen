@@ -105,11 +105,22 @@ function App() {
     setScreen("chat");
   }
 
+  function selectDetail(message) {
+    setSelected(message);
+    setScreen("detail");
+  }
+
   async function logout() {
     await apiPost("/api/logout");
     setUser(null);
     setView("user");
     setScreen("chat");
+  }
+
+  function handleAuthed(nextUser) {
+    setUser(nextUser);
+    setView("user");
+    setScreen(nextUser.role === "relative" ? "dashboard" : "chat");
   }
 
   if (booting) {
@@ -152,9 +163,9 @@ function App() {
           <button
             className={screen === "dashboard" ? "active" : ""}
             onClick={() => setScreen("dashboard")}
-            disabled={view !== "example"}
+            disabled={view === "user" && (!user || user.role === "older")}
           >
-            Dashboard
+            {view === "user" && user?.role === "relative" ? "Care" : "Dashboard"}
           </button>
           <button className={screen === "settings" ? "active" : ""} onClick={() => setScreen("settings")}>
             Settings
@@ -162,28 +173,28 @@ function App() {
         </nav>
 
         {screen === "chat" && view === "user" && (
-          user ? <UserChatScreen user={user} /> : <AuthScreen onAuthed={setUser} />
+          user ? <UserChatScreen user={user} onSelectFlag={selectDetail} /> : <AuthScreen onAuthed={handleAuthed} />
         )}
         {screen === "chat" && view === "example" && (
           <ExampleChatScreen
             messages={exampleMessages}
-            onSelect={(message) => {
-              setSelected(message);
-              setScreen("detail");
-            }}
+            onSelect={selectDetail}
           />
         )}
         {screen === "dashboard" && view === "example" && (
           <DashboardScreen
             flaggedMessages={exampleFlagged}
-            onSelect={(message) => {
-              setSelected(message);
-              setScreen("detail");
-            }}
+            onSelect={selectDetail}
           />
         )}
+        {screen === "dashboard" && view === "user" && user?.role === "relative" && (
+          <CareDashboardScreen onSelect={selectDetail} />
+        )}
         {screen === "detail" && selected && (
-          <DetailScreen message={selected} onBack={() => setScreen(view === "example" ? "dashboard" : "chat")} />
+          <DetailScreen
+            message={selected}
+            onBack={() => setScreen(view === "example" || user?.role === "relative" ? "dashboard" : "chat")}
+          />
         )}
         {screen === "settings" && <SettingsScreen user={user} view={view} onLogout={logout} />}
       </section>
@@ -264,7 +275,7 @@ function AuthScreen({ onAuthed }) {
   );
 }
 
-function UserChatScreen({ user }) {
+function UserChatScreen({ user, onSelectFlag }) {
   const [contacts, setContacts] = useState([]);
   const [requests, setRequests] = useState([]);
   const [threadTab, setThreadTab] = useState("messages");
@@ -568,7 +579,7 @@ function UserChatScreen({ user }) {
 
         {threadTab === "messages" &&
           messages.map((message, index) => (
-            <UserMessage key={message.id} message={message} index={index} currentUser={user} />
+            <UserMessage key={message.id} message={message} index={index} currentUser={user} onSelectFlag={onSelectFlag} />
           ))}
       </div>
 
@@ -629,7 +640,7 @@ function MessageRequests({ requests, onAccept, currentUserRole }) {
   ));
 }
 
-function UserMessage({ message, index, currentUser }) {
+function UserMessage({ message, index, currentUser, onSelectFlag }) {
   const isMine = message.fromUserId === currentUser.id;
   const senderRole = message.fromUser?.role || "older";
   const canSeeFlag = currentUser.role !== "older" && senderRole === "older";
@@ -667,6 +678,9 @@ function UserMessage({ message, index, currentUser }) {
                 <strong>Word-finding pattern noticed</strong>
                 <p>{message.analysis?.summary}</p>
                 <AnalysisSummary analysis={message.analysis} />
+                <button className="flag-tag" onClick={() => onSelectFlag(message)}>
+                  Open scan detail
+                </button>
               </div>
             </article>
           )}
@@ -818,6 +832,85 @@ function DashboardScreen({ flaggedMessages, onSelect }) {
   );
 }
 
+function CareDashboardScreen({ onSelect }) {
+  const [dashboard, setDashboard] = useState(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    apiGet("/api/dashboard")
+      .then(setDashboard)
+      .catch((apiError) => setError(apiError.message));
+  }, []);
+
+  const metrics = dashboard?.metrics || {};
+  const trend = dashboard?.trend || weeklyTrend.map((bar) => ({ ...bar, value: 0 }));
+  const flaggedMessages = dashboard?.flaggedMessages || [];
+  const maxTrend = Math.max(1, ...trend.map((bar) => bar.value || 0));
+
+  return (
+    <section className="screen dashboard-screen">
+      <div className="section-heading">
+        <h1>Care dashboard</h1>
+        <p>Voice-note patterns shared with you by older family members.</p>
+      </div>
+
+      {error && <p className="status-note alert">{error}</p>}
+
+      <div className="metric-grid">
+        <Metric label="Flagged this week" value={String(metrics.flaggedCount || 0)} tone="amber" />
+        <Metric label="Pause markers" value={String(metrics.pauseMarkers || 0)} tone="sage" />
+        <Metric label="Disfluency rate" value={`${Math.round((metrics.disfluencyRate || 0) * 100)}%`} tone="rose" />
+      </div>
+
+      <section className="panel trend-panel">
+        <div className="panel-title">
+          <h2>Weekly trend</h2>
+          <span>{metrics.baselineComparison === "above-baseline" ? "Above baseline" : "Within baseline"}</span>
+        </div>
+        <div className="bar-chart" aria-label="Weekly flagged message bar chart">
+          {trend.map((bar, index) => (
+            <div className="bar-column" key={`${bar.day}-${index}`}>
+              <span className="bar" style={{ "--height": `${Math.max(8, (bar.value / maxTrend) * 100)}%`, animationDelay: `${index * 90}ms` }} />
+              <small>{bar.day}</small>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="suggestion-card">
+        <strong>{flaggedMessages.length ? "Worth discussing with your therapist" : "Nothing new to discuss right now"}</strong>
+        <p>
+          {flaggedMessages.length
+            ? "A few recent notes include pauses or naming detours. This is a gentle prompt for conversation, not a diagnosis."
+            : "When an older family member sends a flagged voice note, it will appear here quietly."}
+        </p>
+      </section>
+
+      <section className="flag-list">
+        <div className="panel-title">
+          <h2>Flagged transcripts</h2>
+          <button>Share with speech therapist</button>
+        </div>
+        {flaggedMessages.length === 0 && (
+          <article className="empty-state inline-empty">
+            <strong>No flagged voice notes yet.</strong>
+            <p>Keep chatting normally. Lumen will only surface patterns here when there is something worth noticing.</p>
+          </article>
+        )}
+        {flaggedMessages.map((message) => (
+          <button className="flag-list-item" key={message.id} onClick={() => onSelect(message)}>
+            <span>
+              <strong>{message.fromUser?.name || "Family member"} · {formatTime(message.createdAt)}</strong>
+              <small>{(message.analysis?.patterns || []).join(" · ") || "word-finding pattern"}</small>
+            </span>
+            <b>{Math.round((message.analysis?.disfluencyRate || 0) * 100)}%</b>
+          </button>
+        ))}
+      </section>
+    </section>
+  );
+}
+
 function Metric({ label, value, tone }) {
   return (
     <div className={`metric ${tone}`}>
@@ -828,6 +921,8 @@ function Metric({ label, value, tone }) {
 }
 
 function DetailScreen({ message, onBack }) {
+  const analysis = message.analysis || {};
+  const timestamp = analysis.timestamp || (message.createdAt ? formatTime(message.createdAt) : message.time || "");
   return (
     <section className="screen detail-screen">
       <button className="back-button" onClick={onBack}>
@@ -835,16 +930,16 @@ function DetailScreen({ message, onBack }) {
       </button>
       <div className="section-heading">
         <h1>Voice note detail</h1>
-        <p>{message.analysis.timestamp}</p>
+        <p>{message.fromUser?.name ? `${message.fromUser.name} · ${timestamp}` : timestamp}</p>
       </div>
 
       <section className="panel transcript-panel">
         <h2>Transcript</h2>
-        <p>{highlightTranscript(message.transcript, message.analysis.highlights)}</p>
+        <p>{highlightTranscript(message.transcript, analysis.highlights)}</p>
       </section>
 
       <div className="pattern-grid">
-        {message.analysis.patterns.map((pattern) => (
+        {(analysis.patterns || []).map((pattern) => (
           <span key={pattern}>{pattern}</span>
         ))}
       </div>
@@ -852,25 +947,25 @@ function DetailScreen({ message, onBack }) {
       <section className="panel analysis-panel">
         <div>
           <span>Pause markers</span>
-          <strong>{message.analysis.pauseMarkers}</strong>
+          <strong>{analysis.pauseMarkers || 0}</strong>
         </div>
         <div>
           <span>Filler tokens</span>
-          <strong>{message.analysis.fillerCount}</strong>
+          <strong>{analysis.fillerCount || 0}</strong>
         </div>
         <div>
           <span>Disfluency rate</span>
-          <strong>{Math.round(message.analysis.disfluencyRate * 100)}%</strong>
+          <strong>{Math.round((analysis.disfluencyRate || 0) * 100)}%</strong>
         </div>
         <div>
           <span>Baseline comparison</span>
-          <strong>{message.analysis.baselineComparison}</strong>
+          <strong>{analysis.baselineComparison || "within-baseline"}</strong>
         </div>
       </section>
 
       <section className="suggestion-card">
         <strong>Care note</strong>
-        <p>{message.analysis.summary}</p>
+        <p>{analysis.summary || "This note is available for gentle review."}</p>
       </section>
     </section>
   );

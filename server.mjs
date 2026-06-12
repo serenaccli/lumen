@@ -121,6 +121,54 @@ app.get("/api/contacts", requireAuth, async (req, res) => {
   res.json(buildContactPayload(db, req.user.id));
 });
 
+app.get("/api/dashboard", requireAuth, async (req, res) => {
+  if ((req.user.role || "older") === "older") {
+    return res.status(403).json({ error: "The care dashboard is for nominated younger relatives." });
+  }
+
+  const db = await loadDb();
+  const now = new Date();
+  const weekStart = new Date(now);
+  weekStart.setHours(0, 0, 0, 0);
+  weekStart.setDate(now.getDate() - 6);
+
+  const visibleMessages = db.messages
+    .filter((message) => message.kind === "voice" && message.toUserId === req.user.id)
+    .map((message) => decorateMessage(db, message))
+    .filter((message) => (message.fromUser?.role || "older") === "older");
+
+  const flaggedMessages = visibleMessages
+    .filter((message) => message.analysis?.flagged)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  const flaggedThisWeek = flaggedMessages.filter((message) => new Date(message.createdAt) >= weekStart);
+  const pauseMarkers = flaggedThisWeek.reduce((total, message) => total + Number(message.analysis?.pauseMarkers || 0), 0);
+  const averageRate = flaggedThisWeek.length
+    ? flaggedThisWeek.reduce((total, message) => total + Number(message.analysis?.disfluencyRate || 0), 0) / flaggedThisWeek.length
+    : 0;
+
+  const trend = Array.from({ length: 7 }, (_item, index) => {
+    const day = new Date(weekStart);
+    day.setDate(weekStart.getDate() + index);
+    const key = day.toISOString().slice(0, 10);
+    return {
+      day: day.toLocaleDateString("en", { weekday: "short" }),
+      value: flaggedMessages.filter((message) => message.createdAt?.slice(0, 10) === key).length,
+    };
+  });
+
+  res.json({
+    metrics: {
+      flaggedCount: flaggedThisWeek.length,
+      pauseMarkers,
+      disfluencyRate: Number(averageRate.toFixed(3)),
+      baselineComparison: averageRate > 0.06 ? "above-baseline" : "within-baseline",
+    },
+    trend,
+    flaggedMessages,
+  });
+});
+
 app.post("/api/contacts", requireAuth, async (req, res) => {
   const email = String(req.body?.email || "").trim().toLowerCase();
   if (!email) return res.status(400).json({ error: "Enter your relative’s account email." });
