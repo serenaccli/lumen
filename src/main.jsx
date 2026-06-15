@@ -154,6 +154,11 @@ function App() {
               Example
             </button>
           </div>
+          {user && (
+            <button className="logout-button" onClick={logout}>
+              Log out
+            </button>
+          )}
         </header>
 
         <nav className="tabs" aria-label="Primary navigation">
@@ -343,7 +348,8 @@ function UserChatScreen({ user, onSelectFlag }) {
       setRequests(payload.requests || []);
       const added = nextContacts.find((contact) => contact.email === contactEmail.trim().toLowerCase());
       setSelectedContactId(added?.id || nextContacts[0]?.id || "");
-      setThreadTab("messages");
+      setThreadTab(added ? "messages" : "requests");
+      setError(payload.notice || "");
       setContactEmail("");
     } catch (apiError) {
       setError(apiError.message);
@@ -457,6 +463,7 @@ function UserChatScreen({ user, onSelectFlag }) {
 
     const durationMs = Math.min(Date.now() - startedAtRef.current, MAX_RECORDING_MS);
     const audioBlob = new Blob(chunksRef.current, { type: recorder.mimeType || "audio/webm" });
+    const audioUrl = URL.createObjectURL(audioBlob);
     const localId = crypto.randomUUID();
     const localMessage = {
       id: localId,
@@ -465,6 +472,7 @@ function UserChatScreen({ user, onSelectFlag }) {
       toUserId: selectedContactId,
       createdAt: new Date().toISOString(),
       durationMs,
+      audioUrl,
       status: "processing",
       transcript: transcriptRef.current,
       reply: "",
@@ -633,9 +641,15 @@ function MessageRequests({ requests, onAccept, currentUserRole }) {
       <div>
         <strong>{request.contact.name}</strong>
         <p>{request.contact.email}</p>
-        <small>{request.direction === "incoming" ? "Wants to message you" : "Waiting for them to join or accept"}</small>
+        <small>
+          {request.direction === "incoming"
+            ? "Wants to message you. Accept to open the conversation."
+            : request.contact.pending
+              ? "Invitation sent. They will see it when they create an account."
+              : "Request sent. Waiting for them to accept."}
+        </small>
       </div>
-      {request.direction === "incoming" && <button onClick={() => onAccept(request.id)}>Accept</button>}
+      {request.direction === "incoming" ? <button onClick={() => onAccept(request.id)}>Accept</button> : <span className="pending-pill">Pending</span>}
     </article>
   ));
 }
@@ -644,11 +658,18 @@ function UserMessage({ message, index, currentUser, onSelectFlag }) {
   const isMine = message.fromUserId === currentUser.id;
   const senderRole = message.fromUser?.role || "older";
   const canSeeFlag = currentUser.role !== "older" && senderRole === "older";
+  const showFlag = canSeeFlag && message.analysis?.flagged;
   if (message.kind === "text") {
     return (
       <article className={`message-row ${isMine ? "mine" : "theirs"}`} style={{ animationDelay: `${120 + index * 80}ms` }}>
-        <div className="bubble">
+        <div className={`bubble text-bubble ${showFlag ? "flagged has-corner-flag" : ""}`}>
+          {showFlag && (
+            <button className="corner-flag" onClick={() => onSelectFlag(message)} aria-label="Open flagged text analysis">
+              <span aria-hidden="true" />
+            </button>
+          )}
           <p>{message.text}</p>
+          {showFlag && <span className="text-flag-label">FLAGGED TEXT</span>}
           <time>{formatTime(message.createdAt)}</time>
         </div>
       </article>
@@ -659,11 +680,7 @@ function UserMessage({ message, index, currentUser, onSelectFlag }) {
     <>
       <article className={`message-row ${isMine ? "mine" : "theirs"}`} style={{ animationDelay: `${120 + index * 80}ms` }}>
         <div className={`bubble voice ${message.status === "error" ? "error" : ""}`}>
-          <div className="voice-card static">
-            <span className="play-dot" />
-            <Waveform animate={message.status === "processing"} />
-            <span className="duration">{formatDuration(message.durationMs)}</span>
-          </div>
+          <VoicePlayer message={message} />
           <time>{formatTime(message.createdAt)}</time>
           {message.status === "processing" && <p className="mini-copy">Analysing gently...</p>}
           {message.status === "error" && <p className="mini-copy">{message.error}</p>}
@@ -675,7 +692,8 @@ function UserMessage({ message, index, currentUser, onSelectFlag }) {
           {canSeeFlag && message.analysis?.flagged && (
             <article className="message-row theirs">
               <div className="bubble analysis-bubble flagged">
-                <strong>Word-finding pattern noticed</strong>
+                <span className="flag-kicker">FLAGGED VOICE NOTE</span>
+                <strong>Word-finding pattern detected</strong>
                 <p>{message.analysis?.summary}</p>
                 <AnalysisSummary analysis={message.analysis} />
                 <button className="flag-tag" onClick={() => onSelectFlag(message)}>
@@ -687,6 +705,51 @@ function UserMessage({ message, index, currentUser, onSelectFlag }) {
         </>
       )}
     </>
+  );
+}
+
+function VoicePlayer({ message }) {
+  const [playing, setPlaying] = useState(false);
+  const audioRef = useRef(null);
+  const canPlay = Boolean(message.audioUrl);
+
+  async function togglePlayback() {
+    if (!canPlay || !audioRef.current) return;
+    if (playing) {
+      audioRef.current.pause();
+      setPlaying(false);
+      return;
+    }
+    try {
+      await audioRef.current.play();
+      setPlaying(true);
+    } catch {
+      setPlaying(false);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      className={`voice-card ${canPlay ? "" : "unavailable"}`}
+      onClick={togglePlayback}
+      disabled={!canPlay}
+      aria-label={canPlay ? (playing ? "Pause voice message" : "Play voice message") : "Voice playback unavailable"}
+    >
+      <span className={`play-dot ${playing ? "playing" : ""}`} />
+      <Waveform animate={message.status === "processing" || playing} />
+      <span className="duration">{canPlay ? formatDuration(message.durationMs) : "No audio"}</span>
+      {canPlay && (
+        <audio
+          ref={audioRef}
+          src={message.audioUrl}
+          preload="metadata"
+          onEnded={() => setPlaying(false)}
+          onPause={() => setPlaying(false)}
+          hidden
+        />
+      )}
+    </button>
   );
 }
 
@@ -759,7 +822,7 @@ function ExampleMessageBubble({ message, index, onSelect }) {
         )}
         {familyFlagVisible && (
           <button className="flag-tag" onClick={() => onSelect(message)}>
-            {message.analysis.tag}
+            FLAGGED: {message.analysis.tag}
           </button>
         )}
         <time>{message.time}</time>
@@ -821,6 +884,7 @@ function DashboardScreen({ flaggedMessages, onSelect }) {
         {flaggedMessages.map((message) => (
           <button className="flag-list-item" key={message.id} onClick={() => onSelect(message)}>
             <span>
+              <em>FLAGGED VOICE NOTE</em>
               <strong>{message.analysis.timestamp}</strong>
               <small>{message.analysis.patterns.join(" · ")}</small>
             </span>
@@ -851,7 +915,7 @@ function CareDashboardScreen({ onSelect }) {
     <section className="screen dashboard-screen">
       <div className="section-heading">
         <h1>Care dashboard</h1>
-        <p>Voice-note patterns shared with you by older family members.</p>
+        <p>Message patterns shared with you by older family members.</p>
       </div>
 
       {error && <p className="status-note alert">{error}</p>}
@@ -882,7 +946,7 @@ function CareDashboardScreen({ onSelect }) {
         <p>
           {flaggedMessages.length
             ? "A few recent notes include pauses or naming detours. This is a gentle prompt for conversation, not a diagnosis."
-            : "When an older family member sends a flagged voice note, it will appear here quietly."}
+            : "When an older family member sends a flagged message, it will appear here quietly."}
         </p>
       </section>
 
@@ -893,13 +957,14 @@ function CareDashboardScreen({ onSelect }) {
         </div>
         {flaggedMessages.length === 0 && (
           <article className="empty-state inline-empty">
-            <strong>No flagged voice notes yet.</strong>
+            <strong>No flagged messages yet.</strong>
             <p>Keep chatting normally. Lumen will only surface patterns here when there is something worth noticing.</p>
           </article>
         )}
         {flaggedMessages.map((message) => (
           <button className="flag-list-item" key={message.id} onClick={() => onSelect(message)}>
             <span>
+              <em>{flagTypeLabel(message)}</em>
               <strong>{message.fromUser?.name || "Family member"} · {formatTime(message.createdAt)}</strong>
               <small>{(message.analysis?.patterns || []).join(" · ") || "word-finding pattern"}</small>
             </span>
@@ -923,19 +988,21 @@ function Metric({ label, value, tone }) {
 function DetailScreen({ message, onBack }) {
   const analysis = message.analysis || {};
   const timestamp = analysis.timestamp || (message.createdAt ? formatTime(message.createdAt) : message.time || "");
+  const messageText = message.transcript || message.text || "";
   return (
     <section className="screen detail-screen">
       <button className="back-button" onClick={onBack}>
         Back
       </button>
       <div className="section-heading">
-        <h1>Voice note detail</h1>
+        <h1>{message.kind === "text" ? "Text message detail" : "Voice note detail"}</h1>
+        {analysis.flagged && <span className="detail-flag">FLAGGED ANALYSIS</span>}
         <p>{message.fromUser?.name ? `${message.fromUser.name} · ${timestamp}` : timestamp}</p>
       </div>
 
       <section className="panel transcript-panel">
-        <h2>Transcript</h2>
-        <p>{highlightTranscript(message.transcript, analysis.highlights)}</p>
+        <h2>{message.kind === "text" ? "Message" : "Transcript"}</h2>
+        <p>{highlightTranscript(messageText, analysis.highlights)}</p>
       </section>
 
       <div className="pattern-grid">
@@ -1136,6 +1203,10 @@ function stopRecognition(recognition) {
 
 function roleLabel(role) {
   return role === "relative" ? "Younger relative" : "Older person";
+}
+
+function flagTypeLabel(message) {
+  return message.kind === "text" ? "FLAGGED TEXT" : "FLAGGED VOICE NOTE";
 }
 
 function formatDuration(ms = 0) {

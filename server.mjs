@@ -21,6 +21,7 @@ const deepseekModel = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
 const openaiTextModel = process.env.OPENAI_TEXT_MODEL || "gpt-5-nano";
 const dataDir = process.env.DATA_DIR || "data";
 const dataPath = `${dataDir}/lumen.json`;
+const audioDir = `${dataDir}/audio`;
 
 const openaiClient = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -30,6 +31,7 @@ const deepseekClient = process.env.DEEPSEEK_API_KEY
   : null;
 
 app.use(express.json({ limit: "1mb" }));
+app.use("/media/audio", express.static(audioDir));
 
 app.get("/api/health", (_req, res) => {
   res.json({
@@ -133,7 +135,7 @@ app.get("/api/dashboard", requireAuth, async (req, res) => {
   weekStart.setDate(now.getDate() - 6);
 
   const visibleMessages = db.messages
-    .filter((message) => message.kind === "voice" && message.toUserId === req.user.id)
+    .filter((message) => message.toUserId === req.user.id)
     .map((message) => decorateMessage(db, message))
     .filter((message) => (message.fromUser?.role || "older") === "older");
 
@@ -185,7 +187,20 @@ app.post("/api/contacts", requireAuth, async (req, res) => {
       (contact.userId === req.user.id && contact.pendingEmail === email)
     );
   });
-  if (!existing) {
+  let notice = "Message request sent.";
+  if (existing) {
+    const existingStatus = existing.status || "accepted";
+    const isReverseRequest = relative && existing.userId === relative.id && existing.contactId === req.user.id;
+    if (existingStatus === "pending" && isReverseRequest) {
+      existing.status = "accepted";
+      existing.acceptedAt = new Date().toISOString();
+      notice = "You are connected now.";
+    } else if (existingStatus === "accepted") {
+      notice = "You are already connected.";
+    } else {
+      notice = "That message request is already waiting.";
+    }
+  } else {
     db.contacts.push({
       id: crypto.randomUUID(),
       userId: req.user.id,
@@ -198,7 +213,7 @@ app.post("/api/contacts", requireAuth, async (req, res) => {
     });
   }
   await saveDb(db);
-  res.json(buildContactPayload(db, req.user.id));
+  res.json({ ...buildContactPayload(db, req.user.id), notice });
 });
 
 app.post("/api/contacts/:id/accept", requireAuth, async (req, res) => {
@@ -232,6 +247,7 @@ app.post("/api/messages", requireAuth, async (req, res) => {
     toEmail: conversation.pendingEmail,
     createdAt: new Date().toISOString(),
     text,
+    analysis: buildTextAnalysis(text),
     status: "complete",
   };
   db.messages.push(message);
@@ -269,8 +285,10 @@ app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, 
     const analysis = mergeAnalysis(deterministic, refined);
     const reply = await generateWarmReply(transcript, analysis, req.user);
     const now = new Date().toISOString();
+    const messageId = crypto.randomUUID();
+    const audioUrl = req.file ? await saveAudioFile(messageId, req.file) : "";
     const message = {
-      id: crypto.randomUUID(),
+      id: messageId,
       kind: "voice",
       fromUserId: req.user.id,
       toUserId: conversation.contactUserId,
@@ -278,6 +296,7 @@ app.post("/api/analyze-voice", requireAuth, upload.single("audio"), async (req, 
       toEmail: conversation.pendingEmail,
       createdAt: now,
       durationMs: metrics.durationMs || 0,
+      audioUrl,
       transcript,
       analysis,
       reply,
@@ -443,6 +462,23 @@ async function saveDb(db) {
     sessions: db.sessions.filter((session) => new Date(session.expiresAt) > new Date()),
   };
   await writeFile(dataPath, JSON.stringify(nextDb, null, 2));
+}
+
+async function saveAudioFile(messageId, file) {
+  await mkdir(audioDir, { recursive: true });
+  const extension = audioExtension(file.mimetype, file.originalname);
+  const filename = `${messageId}${extension}`;
+  await writeFile(`${audioDir}/${filename}`, file.buffer);
+  return `/media/audio/${filename}`;
+}
+
+function audioExtension(mimeType = "", originalName = "") {
+  if (mimeType.includes("mp4")) return ".mp4";
+  if (mimeType.includes("mpeg")) return ".mp3";
+  if (mimeType.includes("wav")) return ".wav";
+  if (mimeType.includes("ogg")) return ".ogg";
+  const match = String(originalName).match(/\.(webm|mp4|mp3|wav|ogg)$/i);
+  return match ? `.${match[1].toLowerCase()}` : ".webm";
 }
 
 function createSession(db, userId) {
@@ -701,6 +737,88 @@ function buildDeterministicAnalysis(transcript, metrics) {
     disfluencyRate,
     baselineComparison: disfluencyRate > 0.06 ? "above-baseline" : "within-baseline",
   };
+}
+
+function buildTextAnalysis(text) {
+  const lower = text.toLowerCase();
+  const words = lower.match(/\b[\w']+\b/g) || [];
+  const highlights = [];
+  const patterns = new Set();
+
+  collectMatches(text, [
+    /\bi forgot\b[^.!?]*/gi,
+    /\bi don't remember\b[^.!?]*/gi,
+    /\bi do not remember\b[^.!?]*/gi,
+    /\bi can't remember\b[^.!?]*/gi,
+    /\bi cannot remember\b[^.!?]*/gi,
+    /\bwhat was i\b[^.!?]*/gi,
+    /\bwhere did i put\b[^.!?]*/gi,
+    /\bdid i already\b[^.!?]*/gi,
+    /\bdid you already tell me\b[^.!?]*/gi,
+  ]).forEach((match) => {
+    highlights.push(match);
+    patterns.add("memory concern");
+  });
+
+  collectMatches(text, [
+    /\bwhat do you call\b[^.!?]*/gi,
+    /\bwhat's it called\b[^.!?]*/gi,
+    /\bthe thing (you use|for|that)\b[^.!?]*/gi,
+    /\bthe one (that|you|from|in)\b[^.!?]*/gi,
+    /\bthe (cold|little|big|silver|kitchen) one\b[^.!?]*/gi,
+  ]).forEach((match) => {
+    highlights.push(match);
+    patterns.add("word-finding");
+  });
+
+  collectMatches(text, [
+    /\bthat thing\b/gi,
+    /\bthe thing\b/gi,
+    /\bthat one\b/gi,
+    /\bit's for\b[^.!?]*/gi,
+    /\byou use it to\b[^.!?]*/gi,
+  ]).forEach((match) => {
+    highlights.push(match);
+    patterns.add("object naming");
+  });
+
+  const fillerMatches = lower.match(/\b(um|uh|erm|ah|you know)\b/g) || [];
+  if (fillerMatches.length > 0) {
+    patterns.add("filler tokens");
+    highlights.push(...fillerMatches);
+  }
+
+  const repeated = [];
+  for (let index = 1; index < words.length; index += 1) {
+    if (words[index] === words[index - 1] && words[index].length > 2) repeated.push(words[index]);
+  }
+  if (repeated.length > 0) {
+    patterns.add("repeated word attempts");
+    highlights.push(...repeated);
+  }
+
+  if (/\b(no|sorry|i mean|rather)\b/i.test(text)) patterns.add("self-correction");
+
+  const disfluencyEvents = highlights.length + repeated.length;
+  const disfluencyRate = words.length ? Number((disfluencyEvents / words.length).toFixed(3)) : 0;
+  const flagged = patterns.has("memory concern") || patterns.has("word-finding") || disfluencyEvents >= 2;
+
+  return {
+    flagged,
+    summary: flagged
+      ? "FLAGGED: This text includes wording that may suggest forgetting, word-finding difficulty, or a naming detour. It may be worth noticing gently if it repeats."
+      : "This text does not show a notable word-finding or forgetting pattern.",
+    patterns: [...patterns],
+    highlights: [...new Set(highlights)].slice(0, 8),
+    pauseMarkers: 0,
+    fillerCount: fillerMatches.length,
+    disfluencyRate,
+    baselineComparison: flagged ? "above-baseline" : "within-baseline",
+  };
+}
+
+function collectMatches(text, patterns) {
+  return patterns.flatMap((pattern) => text.match(pattern) || []).map((match) => match.trim());
 }
 
 function parseJsonObject(text) {
