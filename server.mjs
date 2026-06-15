@@ -134,10 +134,14 @@ app.get("/api/dashboard", requireAuth, async (req, res) => {
   weekStart.setHours(0, 0, 0, 0);
   weekStart.setDate(now.getDate() - 6);
 
+  const contactIds = new Set(buildContacts(db, req.user.id).map((contact) => contact.id));
   const visibleMessages = db.messages
-    .filter((message) => message.toUserId === req.user.id)
-    .map((message) => decorateMessage(db, message))
-    .filter((message) => (message.fromUser?.role || "older") === "older");
+    .filter((message) => {
+      const isDirectParticipant = message.toUserId === req.user.id || message.fromUserId === req.user.id;
+      const isContactThread = contactIds.has(message.toUserId) || contactIds.has(message.fromUserId);
+      return isDirectParticipant || isContactThread;
+    })
+    .map((message) => decorateMessage(db, message));
 
   const flaggedMessages = visibleMessages
     .filter((message) => message.analysis?.flagged)
@@ -747,11 +751,20 @@ function buildTextAnalysis(text) {
 
   collectMatches(text, [
     /\bi forgot\b[^.!?]*/gi,
+    /\bi'?ve forgotten\b[^.!?]*/gi,
+    /\bi have forgotten\b[^.!?]*/gi,
     /\bi don't remember\b[^.!?]*/gi,
     /\bi do not remember\b[^.!?]*/gi,
     /\bi can't remember\b[^.!?]*/gi,
     /\bi cannot remember\b[^.!?]*/gi,
+    /\bi can hardly rem?ember\b[^.!?]*/gi,
+    /\bi.*\brem?ember\b[^.!?]*/gi,
+    /\bi.*\bremmeber\b[^.!?]*/gi,
+    /\bforgotten\b[^.!?]*/gi,
+    /\bforgot\b[^.!?]*/gi,
     /\bwhat was i\b[^.!?]*/gi,
+    /\bwhat was happening\b[^.!?]*/gi,
+    /\bwhat was i doing\b[^.!?]*/gi,
     /\bwhere did i put\b[^.!?]*/gi,
     /\bdid i already\b[^.!?]*/gi,
     /\bdid you already tell me\b[^.!?]*/gi,
@@ -763,6 +776,9 @@ function buildTextAnalysis(text) {
   collectMatches(text, [
     /\bwhat do you call\b[^.!?]*/gi,
     /\bwhat's it called\b[^.!?]*/gi,
+    /\bwhat is it called\b[^.!?]*/gi,
+    /\bwhat'?s .* called again\b[^.!?]*/gi,
+    /\bwaht\b[^.!?]*/gi,
     /\bthe thing (you use|for|that)\b[^.!?]*/gi,
     /\bthe one (that|you|from|in)\b[^.!?]*/gi,
     /\bthe (cold|little|big|silver|kitchen) one\b[^.!?]*/gi,

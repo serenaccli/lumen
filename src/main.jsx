@@ -656,8 +656,7 @@ function MessageRequests({ requests, onAccept, currentUserRole }) {
 
 function UserMessage({ message, index, currentUser, onSelectFlag }) {
   const isMine = message.fromUserId === currentUser.id;
-  const senderRole = message.fromUser?.role || "older";
-  const canSeeFlag = currentUser.role !== "older" && senderRole === "older";
+  const canSeeFlag = currentUser.role !== "older";
   const showFlag = canSeeFlag && message.analysis?.flagged;
   if (message.kind === "text") {
     return (
@@ -690,7 +689,7 @@ function UserMessage({ message, index, currentUser, onSelectFlag }) {
       {message.status === "complete" && (
         <>
           {canSeeFlag && message.analysis?.flagged && (
-            <article className="message-row theirs">
+            <article className={`message-row ${isMine ? "mine" : "theirs"}`}>
               <div className="bubble analysis-bubble flagged">
                 <span className="flag-kicker">FLAGGED VOICE NOTE</span>
                 <strong>Word-finding pattern detected</strong>
